@@ -50,6 +50,8 @@ enum GeminiProError: LocalizedError, Equatable {
     case noPort
     case noCSRFToken
     case probeFailed
+    /// 读不到 Google 登录凭据、或续期失败。云端那条路的前提。
+    case credentials(GeminiOAuthError)
     case network(String)
     case unauthorized
     case http(Int)
@@ -61,32 +63,37 @@ enum GeminiProError: LocalizedError, Equatable {
         case .noPort:       return "找不到 Antigravity 监听端口"
         case .noCSRFToken:  return "无法获取 CSRF Token"
         case .probeFailed:  return "无法读取 Antigravity 的运行状态"
-        case .network(let s): return "连不上本地 Antigravity 服务 (\(s))"
-        case .unauthorized: return "Antigravity 拒绝了请求"
-        case .http(let c):  return "Antigravity 返回 HTTP \(c)"
-        case .decoding:     return "Antigravity 返回了预期之外的内容"
+        case .credentials(let e): return e.errorDescription
+        case .network(let s): return "连不上额度服务 (\(s))"
+        case .unauthorized: return "额度服务拒绝了请求"
+        case .http(let c):  return "额度服务返回 HTTP \(c)"
+        case .decoding:     return "额度服务返回了预期之外的内容"
         }
     }
 
     var suggestion: String {
         switch self {
         case .notRunning:
-            return "请先启动 Antigravity 桌面应用并登录，再回来刷新。"
+            return "本机既没有可用的登录凭据，也没有检测到 Antigravity 在运行。\n\n"
+                + "打开一次 Antigravity（桌面版或 CLI）登录，之后即使关掉它也能读额度。"
         case .noPort:
             return "Antigravity 进程在跑，但读不到它的监听端口。请重启 Antigravity 后重试。"
         case .noCSRFToken:
-            return "Antigravity 的启动参数里没有 CSRF Token，可能是版本改过了。请更新 Antigravity 或反馈。"
+            return "CLI 模式下的 language_server 不对外暴露 CSRF Token，这条本地路走不通。\n\n"
+                + "请确认 Antigravity 已登录，程序会改走云端读取。"
         case .probeFailed:
             return "系统拒绝了「列出进程」（ps 被拦下），同时也读不到 Antigravity 的日志。\n\n"
                 + "如果 Antigravity 确实在运行，请检查是否开了什么安全软件在拦截进程枚举。"
+        case .credentials(let e):
+            return e.suggestion
         case .network(let detail):
-            return "本地服务不可达，请确认 Antigravity 正在运行。\n\n底层报错：\(detail)"
+            return "请求没发出去或超时。检查网络 / 代理后重试。\n\n底层报错：\(detail)"
         case .unauthorized:
-            return "CSRF Token 可能已失效，请重启 Antigravity 后重试。"
+            return "登录状态可能已失效。打开一次 Antigravity 重新登录即可。"
         case .http:
-            return "Antigravity 返回了非预期的状态码。请确认版本兼容性。"
+            return "额度服务返回了非预期的状态码。请确认版本兼容性。"
         case .decoding:
-            return "响应不是预期的结构。Antigravity 更新后接口可能已变化。"
+            return "响应不是预期的结构。Google 的接口可能已变化。"
         }
     }
 }
@@ -131,6 +138,19 @@ enum AntigravityProbe {
 
     /// 探测本机的 Antigravity 语言服务器。
     ///
+    /// 两条路径：
+    /// 1. **进程扫描**：`ps` 列出全部进程，找 `language_server`（桌面版 fork 的）
+    ///    或 `agy`（Antigravity CLI —— 它内嵌了 language_server，进程名就是 agy）。
+    ///    端口靠 `lsof` 发现。
+    /// 2. **日志兜底**：`ps` 起不来（沙箱、MDM 限制）时，读 Antigravity 自己写的日志。
+    ///    桌面版在 `~/Library/Logs/Antigravity/main.log`，CLI 在
+    ///    `~/.gemini/antigravity-cli/log/cli-*.log`。
+    ///
+    /// ⚠️ 这条路**只覆盖「桌面版在跑」的情况**。CLI 模式下 language_server 的
+    /// CSRF token 只存在进程内存里，外部读不到（环境变量里没有、日志里也不记），
+    /// 所以即使探测到了端口也调不通。CLI / Gemini 桌面版的额度走 `GeminiCloudQuota`
+    /// 那条云端路径，见 `GeminiProService.fetch()`。
+    ///
     /// **会起 `ps` / `lsof` 子进程并同步等待**，不要在主线线程或 SwiftUI 的 body 里调。
     static func detect() -> Detection {
         if let processes = listProcesses() {
@@ -155,7 +175,10 @@ enum AntigravityProbe {
                                          ports: unique,
                                          csrfToken: token))
             }
-            // `ps` 能用且没找到 —— 那就是真的没在跑，不必再去翻日志
+
+            // `ps` 能用且没找到 Antigravity 相关进程 —— 那就是真的没在跑。
+            // 不必再去翻日志：如果桌面版和 CLI 都没起 `language_server`/`agy` 进程，
+            // 日志里也不会有新鲜的端口信息。
             return sawLanguageServer ? .noPort : .notRunning
         }
 
@@ -191,22 +214,59 @@ enum AntigravityProbe {
     private static let logLivenessWindow: TimeInterval = 10 * 60
 
     private static func logsSuggestRunning() -> Bool {
-        let log = logDirectory.appendingPathComponent("language_server.log")
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: log.path),
-              let modified = attrs[.modificationDate] as? Date else { return false }
-        return Date().timeIntervalSince(modified) < logLivenessWindow
+        // 桌面版：language_server.log 在运行期间是持续写入的
+        let desktopLog = logDirectory.appendingPathComponent("language_server.log")
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: desktopLog.path),
+           let modified = attrs[.modificationDate] as? Date,
+           Date().timeIntervalSince(modified) < logLivenessWindow {
+            return true
+        }
+        // CLI：glog 按次启动分文件写（cli-20260922_143341.log），看最新那个的 mtime
+        if let modified = latestLogModification(in: cliLogDirectory),
+           Date().timeIntervalSince(modified) < logLivenessWindow {
+            return true
+        }
+        return false
     }
 
-    /// 从 `main.log` 里抠出 CSRF Token 和 HTTPS 端口。两者都在同一份日志里：
+    /// Antigravity CLI 的日志目录。CLI 走 glog，每次启动写一个新文件。
+    private static var cliLogDirectory: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".gemini/antigravity-cli/log", isDirectory: true)
+    }
+
+    /// 目录下最新的一个 `.log` 文件的修改时间。
+    private static func latestLogModification(in directory: URL) -> Date? {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else {
+            return nil
+        }
+        var newest: Date?
+        for name in names where name.hasSuffix(".log") {
+            let path = directory.appendingPathComponent(name).path
+            guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+                  let modified = attrs[.modificationDate] as? Date else { continue }
+            if newest == nil || modified > newest! { newest = modified }
+        }
+        return newest
+    }
+
+    /// 从桌面版的 `main.log` 里抠出 CSRF Token 和 HTTPS 端口。两者都在同一份日志里：
     /// ```
     /// Spawning: .../language_server ... --https_server_port 0 --csrf_token <uuid> --app_data_dir antigravity ...
     /// [Auto-Restart] Port changed! Reloading all windows with URL: https://127.0.0.1:53098/
     /// ```
     /// 端口是**应用自己报出来的实际值**（`--https_server_port` 传的是 0），比 lsof 猜更准。
+    ///
+    /// ⚠️ 存活判断必须用**这份日志自己的** mtime，不能复用 `logsSuggestRunning()` ——
+    /// 那个还会看 CLI 的日志目录。否则「CLI 在跑、桌面版早关了」的时候，
+    /// 这里会把 main.log 里**过期**的端口和 CSRF token 当成有效值返回，
+    /// 让调用方去连一个早就没人听的端口。
     private static func serverInfoFromLogs() -> ServerInfo? {
-        guard logsSuggestRunning() else { return nil }
-        guard let text = try? String(contentsOf: logDirectory.appendingPathComponent("main.log"),
-                                     encoding: .utf8) else { return nil }
+        let log = logDirectory.appendingPathComponent("main.log")
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: log.path),
+              let modified = attrs[.modificationDate] as? Date,
+              Date().timeIntervalSince(modified) < logLivenessWindow else { return nil }
+        guard let text = try? String(contentsOf: log, encoding: .utf8) else { return nil }
         return serverInfo(fromLogText: text)
     }
 
@@ -246,12 +306,37 @@ enum AntigravityProbe {
         return results
     }
 
+    /// 这条命令行是不是 Antigravity 的 language_server。
+    ///
+    /// 两种形态：
+    /// - **桌面版**：Electron fork 出 `.../Antigravity.app/Contents/Resources/bin/language_server`，
+    ///   命令行里同时有 `language_server` 和 `antigravity`。
+    /// - **CLI**：`agy` 把 language_server 跑在**自己进程里**，进程名就是 `agy`，
+    ///   命令行里根本不出现 `language_server` 字样 —— 只按关键词找是永远找不到它的。
+    ///   实测 CLI 进程就是 `~/.local/bin/agy` 这一个词。
     private static func isAntigravityLanguageServer(_ command: String) -> Bool {
         let lower = command.lowercased()
-        // 必须是 language_server 进程
-        guard lower.contains("language_server") || lower.contains("language-server") else { return false }
-        // 且必须属于 Antigravity（二进制路径在 Antigravity.app 里，或 --app_data_dir 指向它）
-        return lower.contains("antigravity")
+
+        if lower.contains("language_server") || lower.contains("language-server") {
+            // 桌面版的 language_server 一定带着 antigravity 的路径或 --app_data_dir
+            return lower.contains("antigravity")
+        }
+
+        return isAntigravityCLI(command)
+    }
+
+    /// 是不是 Antigravity CLI 的可执行文件（`agy`）。
+    ///
+    /// 只认「命令行的第一个词就是 agy 本身」，不去全文搜 `agy` 子串 ——
+    /// 那会把 `--some-flag=agy` 之类的东西一起捞进来。
+    private static func isAntigravityCLI(_ command: String) -> Bool {
+        let first = command.trimmingCharacters(in: .whitespaces)
+            .split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+            .first
+            .map(String.init)?
+            .lowercased()
+        guard let first else { return false }
+        return first.hasSuffix("/agy") || first == "agy"
     }
 
     private static func extractCSRFToken(from command: String) -> String? {
@@ -588,7 +673,16 @@ final class GeminiProService {
     private static let quotaSummaryPath = "exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
     private static let userStatusPath   = "exa.language_server_pb.LanguageServerService/GetUserStatus"
 
+    /// 云端额度接口。桌面版的 language_server 内部调的就是它，
+    /// 响应结构和本地那条路**完全一致**，所以解析器能直接复用。
+    private static let cloudQuotaEndpoint =
+        URL(string: "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary")!
+
     private let session: URLSession
+
+    /// 云端请求用的 session。本地那条要放行 `127.0.0.1` 的自签证书，这条**不要** ——
+    /// 对着公网地址跳过证书校验等于自己拆掉 HTTPS。
+    private let cloudSession: URLSession
 
     /// 上次调通的端口。语言服务器的端口是动态分配的，每次刷新都重新 lsof 太慢，
     /// 记住它先试，命中就省掉一轮探测。
@@ -604,9 +698,89 @@ final class GeminiProService {
         session = URLSession(configuration: config,
                              delegate: InsecureLocalhostDelegate(),
                              delegateQueue: nil)
+
+        // 云端给宽一点：续期 + 查询可能跨两次请求，8 秒容易误判成网络故障。
+        let cloudConfig = URLSessionConfiguration.ephemeral
+        cloudConfig.timeoutIntervalForRequest = 20
+        cloudConfig.timeoutIntervalForResource = 30
+        cloudConfig.requestCachePolicy = .reloadIgnoringLocalCacheData
+        cloudSession = URLSession(configuration: cloudConfig)
     }
 
+    /// 取 Gemini Pro 额度。
+    ///
+    /// **先走云端，再退本地。** 顺序很重要：
+    /// - 云端那条（`fetchViaCloud`）只依赖登录凭据，**不要求任何 Antigravity 进程在跑**。
+    ///   用户关掉桌面版、只开着 Antigravity CLI 或 Gemini 桌面版时，只有这条路能出数。
+    /// - 本地那条（`fetchViaLanguageServer`）要求 language_server 在跑，而且实际上必须是
+    ///   **桌面版**启动的那种 —— CLI 模式下 CSRF token 只在进程内存里，外部拿不到。
+    ///
+    /// 所以本地那条现在只是兜底：万一凭据读不到、但桌面版正好开着。
     func fetch() async throws -> GeminiProUsage {
+        do {
+            return try await fetchViaCloud()
+        } catch let cloudError {
+            do {
+                return try await fetchViaLanguageServer()
+            } catch {
+                // 两条都不通。报云端那个错 —— 它的提示更贴近「去登录一次」
+                // 这种用户真正能执行的动作。
+                throw cloudError
+            }
+        }
+    }
+
+    // MARK: - 云端直连
+
+    /// 直接问 Google 云端要额度。
+    ///
+    /// 接口：`POST https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`，
+    /// 带 `Authorization: Bearer <access token>`。返回结构：
+    /// ```json
+    /// { "groups": [ { "displayName": "Gemini Models",
+    ///                 "buckets": [ { "bucketId": "gemini-5h", "window": "5h",
+    ///                                "remainingFraction": 0.9048, "resetTime": "..." } ] } ] }
+    /// ```
+    /// 和本地 language_server 的响应同构，所以解析器直接复用 `GeminiProParser`。
+    private func fetchViaCloud() async throws -> GeminiProUsage {
+        let token: String
+        do {
+            token = try await GeminiOAuth.accessToken()
+        } catch let error as GeminiOAuthError {
+            // 转成 GeminiProError，让上层的错误处理（提示语、退避策略）能认出它
+            throw GeminiProError.credentials(error)
+        }
+
+        var request = URLRequest(url: Self.cloudQuotaEndpoint)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("antigravity", forHTTPHeaderField: "User-Agent")
+        request.httpBody = "{}".data(using: .utf8)
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await cloudSession.data(for: request)
+        } catch {
+            throw GeminiProError.network(error.localizedDescription)
+        }
+
+        if let http = response as? HTTPURLResponse {
+            switch http.statusCode {
+            case 200...299: break
+            case 401, 403:  throw GeminiProError.unauthorized
+            default:        throw GeminiProError.http(http.statusCode)
+            }
+        }
+
+        return try GeminiProParser.parse(data: data)
+    }
+
+    // MARK: - 本地 language_server（兜底）
+
+    private func fetchViaLanguageServer() async throws -> GeminiProUsage {
         // ps / lsof 都是同步等待的子进程，挪到后台线程，别卡住调用方（多半是主线程）
         let detection = await Task.detached(priority: .userInitiated) {
             AntigravityProbe.detect()

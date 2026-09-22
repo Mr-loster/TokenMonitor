@@ -37,11 +37,11 @@ final class AppState: ObservableObject {
     @Published var editingKeyDraft: String = ""
     /// 凭据缺失或解不开、需要用户重新填入的账号
     @Published var accountsNeedingKey: Set<UUID> = []
-    /// 本机是否检测到 Antigravity。
+    /// 本机能不能读 Gemini Pro 额度。**有登录凭据就算**，不要求 Antigravity 在跑。
     ///
-    /// 之所以做成 @Published 的状态而不是让界面直接问 `AntigravityProbe.isRunning`：
-    /// 探测要起 `ps` 子进程并同步等待，而 SwiftUI 的 body 每次重绘都会执行 ——
-    /// 直接在 body 里探测等于每帧 fork 一个进程，面板会卡到没法用。
+    /// 之所以做成 @Published 的状态而不是让界面每次自己去问：
+    /// 判断要读凭据文件 / 钥匙串，进程兜底还要起 `ps` 子进程并同步等待，
+    /// 而 SwiftUI 的 body 每次重绘都会执行 —— 直接在 body 里做等于每帧跑一遍，面板会卡到没法用。
     @Published var geminiAvailable = false
 
     /// 菜单栏轮播到第几家（对启用中的服务商取模）。
@@ -96,11 +96,16 @@ final class AppState: ObservableObject {
                        + "需重填凭据 \(accountsNeedingKey.count) 个，\(credentials.bindingDescription)")
     }
 
-    /// 重新探测本机有没有 Antigravity。
+    /// 重新判断本机能不能读 Gemini Pro 额度。
+    ///
+    /// 判断口径是「**有没有可用的登录凭据**」，不是「Antigravity 进程在不在跑」——
+    /// 额度走的是云端接口，关掉桌面版、只开着 CLI 或 Gemini 桌面版照样能读。
+    /// 进程检查只作兜底（万一凭据读不到、但 language_server 正好在跑）。
+    ///
     /// 结果只在真的变了的时候才写回，免得每次自动刷新都无谓地触发一轮界面重绘。
     func refreshGeminiAvailability() async {
         let available = await Task.detached(priority: .utility) {
-            AntigravityProbe.isRunning
+            GeminiOAuth.hasCredentials || AntigravityProbe.isRunning
         }.value
         if geminiAvailable != available { geminiAvailable = available }
     }
@@ -418,15 +423,20 @@ final class AppState: ObservableObject {
                            + "窗口=\(windows.map(\.windowLabel).joined(separator: " / "))，"
                            + "熔断=\(usage.limitReached)")
         } catch {
-            // 「Antigravity 没开」是最常见的临时状态，用户随时可能把它打开。
-            // 这种情况不退避 —— 否则要干等满 15 分钟才会再去连一次。
-            let temporary: Bool
-            if case .notRunning = (error as? GeminiProError) { temporary = true } else { temporary = false }
+            let geminiError = error as? GeminiProError
+            // 「Antigravity 没开」和「还没登录」都是**用户随时能自己解决**的临时状态。
+            // 这两种不退避 —— 否则要干等满 15 分钟才会再去连一次。
+            let temporary = geminiError.map { e -> Bool in
+                switch e {
+                case .notRunning, .credentials: return true
+                default:                        return false
+                }
+            } ?? false
             applyFailure(account,
                          error: error,
                          message: error.localizedDescription,
                          temporary: temporary,
-                         geminiError: error as? GeminiProError)
+                         geminiError: geminiError)
         }
     }
 

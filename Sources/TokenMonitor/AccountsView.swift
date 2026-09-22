@@ -79,7 +79,7 @@ struct AccountsView: View {
         let geminiAdded = state.accounts.contains { $0.provider == .gemini }
         if !geminiAdded, state.geminiAvailable {
             importButton(icon: "sparkles", title: "导入本机 Gemini Pro",
-                         help: "将本机 Antigravity 运行的 Gemini Pro 额度加入监控") {
+                         help: "将本机 Antigravity 账号的 Gemini Pro 额度加入监控") {
                 state.addLocalGeminiAccount()
             }
         }
@@ -454,10 +454,10 @@ struct AccountEditorView: View {
 
     @ViewBuilder
     private var geminiFields: some View {
-        Text("Gemini Pro 额度通过本机运行的 Antigravity 语言服务器自动获取，"
+        Text("Gemini Pro 额度用本机 Antigravity 的登录凭据从云端获取，"
              + "不需要手动输入 API Key。\n\n"
-             + "请确保 Antigravity 桌面应用正在运行并已登录；"
-             + "没有运行时会显示「未检测到 Antigravity」。")
+             + "只要登录过一次，之后**关掉 Antigravity 也能正常读取** ——"
+             + "用桌面版、CLI 还是 Gemini 桌面版都不影响。")
             .font(.system(size: 10))
             .foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)

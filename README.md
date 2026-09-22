@@ -161,7 +161,7 @@ Grok 的 `auth.json` 顶层是「issuer::client_id → 凭据」的映射，键�
 ### 首次启动会自动导入
 
 本机装了哪个 CLI 就自动把哪个收进账号列表，**不需要手动操作**：
-`~/.grok/auth.json` → Grok、`~/.codex/auth.json` → Codex、Antigravity 在运行 → Gemini Pro。
+`~/.grok/auth.json` → Grok、`~/.codex/auth.json` → Codex、Antigravity 已登录 → Gemini Pro。
 删掉之后不会再自己冒出来。
 
 ---
@@ -181,9 +181,12 @@ Cloudflare 的风控拦了这次请求。稍后重试；若持续出现，说明
 **Codex 显示「连不上 chatgpt.com」？**
 额度接口挂在 `chatgpt.com` 上，国内直连不通，需要让 Codex 能正常联网（例如开启代理）。
 
+**Gemini Pro 显示「本机没有找到 Antigravity 的登录凭据」？**
+本机没登录过 Antigravity。打开一次 Antigravity（**桌面版或 CLI 都行**）登录即可 ——
+之后**关掉它也能正常读额度**，凭据是登录时落盘的，程序自己会续期。
+
 **Gemini Pro 显示「未检测到 Antigravity」？**
-Antigravity 没在运行（关掉它就读不到额度，这是必然的 —— 数据是从它自己的本地服务里拿的）。
-把它打开，回到面板点「实时查询」即可，不用等下一次自动刷新。
+既没有可用凭据，也没探测到 Antigravity 在运行。同上，登录一次即可。
 
 **Gemini Pro 显示「无法读取 Antigravity 的运行状态」？**
 进程探测被系统拦下了（`ps` 起不来），同时也读不到 Antigravity 的日志。
@@ -225,7 +228,8 @@ bash build.sh
 
 ### 探测要起子进程，绝不能放在 SwiftUI 的 body 里
 
-判断「本机有没有 Antigravity」要跑 `ps` / `lsof`，而且**是同步等待**的。
+判断「本机能不能读 Gemini Pro 额度」现在主要看**有没有登录凭据**（读文件 / 钥匙串），
+进程探测只是兜底 —— 后者要跑 `ps` / `lsof`，而且**是同步等待**的。
 结果缓存在 `AppState.geminiAvailable` 里，只在刷新时后台更新，界面只读缓存值 ——
 写在 body 里等于每次重绘都 fork 一个进程，面板会卡到没法用。
 
@@ -251,14 +255,17 @@ bash build.sh
 - **三家的接口都不是官方公开 API**，厂商改版后可能失效：
   Grok 走 `grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig`，
   Codex 走 `chatgpt.com/backend-api/wham/usage`，
-  Gemini Pro 走本机 Antigravity 语言服务器的 `RetrieveUserQuotaSummary`
+  Gemini Pro 走 `daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`
 - **Grok 只有周额度，没有 5 小时窗口。** 接口只回一个 7 天周期，
   换请求体也不影响返回。界面上会老实显示成一个环，不编一个窗口出来
 - **Grok 的产品拆分只有数字 id**（实测见过 2/4/5/8），可读名字定义在服务端下发的描述符里，
   本机二进制里查不到。所以只对能确定的 id 起名（`1` = API、`2` = Grok Build），
   其余显示成「分项 N」，**不编一个可能错的名字**
-- **Gemini Pro 依赖 Antigravity 正在运行**：数据是从它的本地语言服务器拿的，
-  关掉就读不到。程序不保存任何 Google 凭据，也不碰 Antigravity 的登录状态
+- **Gemini Pro 需要本机登录过 Antigravity**（桌面版或 CLI 都行）：凭据在
+  `~/.gemini/jetski-standalone-oauth-token`（桌面版写）或登录钥匙串
+  （`service=gemini / account=antigravity`，CLI 写）里，程序读它去调 Google 云端接口。
+  **登录一次之后，关掉 Antigravity 也能读** —— 用桌面版、CLI 还是 Gemini 桌面版都不影响。
+  程序不保存 Google 凭据、不碰登录状态；续期拿到的新 token 只在内存里用，**不回写**
 - **Grok 的 access_token 只有 6 小时**。本程序会在过期时帮它续期并写回 `auth.json`；
   如果续期也失败（refresh_token 失效），需要手动跑一次 `grok login`
 - 换机器或换主板后需重新填入粘贴型凭据

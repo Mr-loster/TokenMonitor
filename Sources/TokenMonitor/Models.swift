@@ -46,7 +46,7 @@ enum Provider: String, Codable, CaseIterable, Identifiable {
         switch self {
         case .grok:   return "Grok CLI 的 auth.json"
         case .codex:  return "Codex 的 auth.json"
-        case .gemini: return "本地 Antigravity 探测"
+        case .gemini: return "Antigravity 的登录凭据"
         }
     }
 
@@ -133,7 +133,7 @@ struct APIAccount: Identifiable, Codable, Equatable {
 
     /// 界面展示用的凭据说明
     var credentialSummary: String {
-        if provider == .gemini { return "本地 Antigravity 探测" }
+        if provider == .gemini { return "Antigravity 的登录凭据" }
         guard provider.usesAuthFile else { return maskedKey }
         switch credentialKind {
         case .pastedToken:

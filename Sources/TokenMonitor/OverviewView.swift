@@ -85,7 +85,7 @@ struct OverviewView: View {
             return ("检测到本机已登录 Codex", "导入之后额度会显示在这里和菜单栏。", "导入")
         case .gemini:
             guard state.geminiAvailable else { return nil }
-            return ("检测到本机正在运行 Antigravity", "添加后 Gemini Pro 额度会显示在这里和菜单栏。", "添加")
+            return ("检测到本机已登录 Antigravity", "添加后 Gemini Pro 额度会显示在这里和菜单栏。", "添加")
         }
     }
 
