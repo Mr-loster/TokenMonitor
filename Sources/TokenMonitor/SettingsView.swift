@@ -6,16 +6,35 @@ struct SettingsView: View {
 
     @AppStorage("refreshIntervalMinutes") private var refreshInterval: Int = 5
     @AppStorage("menuBarShowsBalance") private var menuBarShowsBalance: Bool = true
-    @AppStorage("menuBarDisplayMode") private var displayMode: MenuBarDisplayMode = .current
-    @AppStorage("defaultAlertThreshold") private var defaultThreshold: Double = 10
+    /// 菜单栏轮播间隔（秒），0 = 不轮播。默认 5 秒，和 `AppState.menuBarRotateSeconds` 保持一致。
+    @AppStorage("menuBarRotateSeconds") private var menuBarRotateSeconds: Int = 5
+    @AppStorage("defaultAlertThreshold") private var defaultThreshold: Double = 20
     @AppStorage("launchAtLogin") private var launchAtLogin: Bool = false
 
-    @LocalState private var confirmingClearAll = false
     @LocalState private var confirmingClearCredentials = false
     /// 预警线用字符串暂存。
     /// 直接用 TextField(value:format:) 绑 Double 会有个坑：清空或只输了个小数点时解析失败，
     /// SwiftUI 会把文字弹回原值，表现为「改不动」。改成字符串暂存、只在能解析时写回。
     @LocalState private var thresholdText: String = ""
+
+    /// 「固定显示」选择器的绑定。
+    ///
+    /// 不能直接绑 `state.menuBarPinnedProviderRaw`：用户选的那一家可能已经被停用或删掉，
+    /// 这时存的值不在选项里，Picker 会显示成空白。所以 getter 里做一次兜底 ——
+    /// 不在列表里就退到第一家，和菜单栏实际显示的那家保持一致。
+    private var pinnedSelection: Binding<String> {
+        Binding(
+            get: {
+                let available = state.menuBarProviders.map(\.rawValue)
+                return available.contains(state.menuBarPinnedProviderRaw)
+                    ? state.menuBarPinnedProviderRaw
+                    : (available.first ?? "")
+            },
+            set: { raw in
+                state.setMenuBarPinnedProvider(Provider(rawValue: raw))
+            }
+        )
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -38,37 +57,59 @@ struct SettingsView: View {
                         state.restartTimer()
                     }
                 }
-                Text("间隔越短，消耗趋势越准，但请求也越频繁")
+                Text("三家都是按「剩余百分比」计量的额度，刷新只是把数字更新一下，间隔短一点更及时。")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             section("菜单栏") {
-                Toggle("在菜单栏显示余额数字", isOn: $menuBarShowsBalance)
+                Toggle("在菜单栏显示剩余百分比", isOn: $menuBarShowsBalance)
                     .font(.system(size: 12))
                 Text("关闭后只显示状态图标，鼠标移上去仍可查看")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
 
-                if state.enabledAccounts.count > 1 {
-                    Divider()
+                HStack {
+                    Text("轮播间隔")
+                        .font(.system(size: 12))
+                    Spacer()
+                    Picker("", selection: $menuBarRotateSeconds) {
+                        Text("不轮播").tag(0)
+                        Text("3 秒").tag(3)
+                        Text("5 秒").tag(5)
+                        Text("10 秒").tag(10)
+                        Text("30 秒").tag(30)
+                    }
+                    .labelsHidden()
+                    .frame(width: 108)
+                    .onChange(of: menuBarRotateSeconds) { _, _ in
+                        state.restartRotationTimer()
+                    }
+                }
+
+                // 不轮播时让用户自己指定显示哪一家。轮播中不显示这一行 ——
+                // 那时「显示哪家」由定时器决定，摆个选择器在这儿只会让人以为选了就固定。
+                if menuBarRotateSeconds == 0 && !state.menuBarProviders.isEmpty {
                     HStack {
-                        Text("显示内容")
+                        Text("固定显示")
                             .font(.system(size: 12))
                         Spacer()
-                        Picker("", selection: $displayMode) {
-                            ForEach(MenuBarDisplayMode.allCases) { mode in
-                                Text(mode.displayName).tag(mode)
+                        Picker("", selection: pinnedSelection) {
+                            ForEach(state.menuBarProviders) { provider in
+                                Text(provider.displayName).tag(provider.rawValue)
                             }
                         }
                         .labelsHidden()
-                        .frame(width: 128)
+                        .frame(width: 108)
                     }
-                    Text("DeepSeek 看当前账号或合计金额；Codex 始终显示最低的剩余百分比，两者并排。状态色取更紧张的一方。")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
-                        .fixedSize(horizontal: false, vertical: true)
                 }
+
+                Text("三家并排太长，菜单栏改成**轮流显示一家**，颜色跟着它自己的额度状态走。"
+                     + "选「不轮播」时可以指定固定显示哪一家。")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             section("预警") {
@@ -76,7 +117,7 @@ struct SettingsView: View {
                     Text("新账号默认预警线")
                         .font(.system(size: 12))
                     Spacer()
-                    TextField("10", text: $thresholdText)
+                    TextField("20", text: $thresholdText)
                         .textFieldStyle(.roundedBorder)
                         .frame(width: 70)
                         .onChange(of: thresholdText) { _, newValue in
@@ -86,13 +127,12 @@ struct SettingsView: View {
                                 defaultThreshold = value
                             }
                         }
-                    Text("元")
+                    Text("%")
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                 }
-                Text("余额低于预警线时发送系统通知。只影响之后新建的 DeepSeek 账号，"
-                     + "已有账号在「账号」页右键单独改。\nCodex 账号的预警线是「剩余百分比」，"
-                     + "新建时默认 \(Int(AppState.defaultCodexThreshold))%。")
+                Text("剩余百分比低于预警线时发送系统通知。只影响之后新建的账号，"
+                     + "已有账号在「账号」页右键单独改。")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -112,7 +152,7 @@ struct SettingsView: View {
             section("凭据") {
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("DeepSeek API Key 存储")
+                        Text("粘贴的 token 存储")
                             .font(.system(size: 12))
                         Text("\(state.credentialBindingDescription) · AES-GCM 加密")
                             .font(.system(size: 10))
@@ -127,19 +167,21 @@ struct SettingsView: View {
                     Spacer(minLength: 6)
                 }
 
-                Text("已不再使用系统钥匙串，所以不会再弹密码框。代价是：换机器或换主板后密钥对不上，需要重新填入 Key；删掉这个文件也一样。")
+                Text("Grok 和 Codex 的凭据默认**不经过这里** —— 直接读它们自己的 auth.json，"
+                     + "由它们负责续期，本程序只读不写（唯一的例外是 Grok 的 access_token 过期时，"
+                     + "会帮它续一次并写回 auth.json）。只有「粘贴 access_token」方式的账号才存在上面这个文件里。")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                Text("Codex 账号的凭据不走这里 —— 默认直接读 Codex 自己的 auth.json，"
-                     + "由 Codex 负责续期，本程序只读不写。只有「粘贴 access_token」方式的账号才存在上面这个文件里。")
+                Text("已不再使用系统钥匙串，所以不会再弹密码框。代价是：换机器或换主板后密钥对不上，"
+                     + "需要重新填入；删掉这个文件也一样。")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
 
                 if !state.accountsNeedingKey.isEmpty {
-                    Label("有 \(state.accountsNeedingKey.count) 个账号需要重新填入 Key，到「账号」页编辑即可",
+                    Label("有 \(state.accountsNeedingKey.count) 个账号需要重新填入凭据，到「账号」页编辑即可",
                           systemImage: "exclamationmark.triangle.fill")
                         .font(.system(size: 10))
                         .foregroundStyle(.orange)
@@ -166,7 +208,7 @@ struct SettingsView: View {
                         }
                         .controlSize(.small)
                     } else {
-                        Button("清空本地 Key") { confirmingClearCredentials = true }
+                        Button("清空本地凭据") { confirmingClearCredentials = true }
                             .controlSize(.small)
                             .disabled(!state.accounts.contains { !$0.keySuffix.isEmpty })
                     }
@@ -176,9 +218,9 @@ struct SettingsView: View {
             section("数据") {
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("快照存储位置")
+                        Text("数据目录")
                             .font(.system(size: 12))
-                        Text("~/Library/Application Support/Token查询")
+                        Text(AppPaths.displayPath)
                             .font(.system(size: 10))
                             .foregroundStyle(.tertiary)
                             .textSelection(.enabled)
@@ -186,48 +228,15 @@ struct SettingsView: View {
                     Spacer()
                 }
 
-                Text("已记录 \(state.snapshotCount) 条快照，自动保留最近 90 天")
+                Text("只存账号列表、凭据和诊断日志。三家额度都是实时查询的，不落地。")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
 
-                HStack(spacing: 8) {
-                    Button("打开数据文件夹") {
-                        let base = FileManager.default.urls(for: .applicationSupportDirectory,
-                                                            in: .userDomainMask).first
-                        if let url = base?.appendingPathComponent("Token查询") {
-                            NSWorkspace.shared.open(url)
-                        }
-                    }
-                    .controlSize(.small)
-
-                    Button("清空当前账号历史") {
-                        if let account = state.selectedAccount {
-                            state.clearHistory(for: account.id)
-                        }
-                    }
-                    .controlSize(.small)
-                    .disabled(state.selectedAccount == nil)
+                Button("打开数据文件夹") {
+                    NSWorkspace.shared.open(AppPaths.dataDirectory)
                 }
-
-                if confirmingClearAll {
-                    HStack(spacing: 8) {
-                        Text("确认清空全部账号的历史数据？")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.red)
-                        Spacer(minLength: 4)
-                        Button("取消") { confirmingClearAll = false }
-                            .controlSize(.small)
-                        Button("确认清空") {
-                            state.clearAllHistory()
-                            confirmingClearAll = false
-                        }
-                        .controlSize(.small)
-                    }
-                } else {
-                    Button("清空全部历史数据") { confirmingClearAll = true }
-                        .controlSize(.small)
-                        .disabled(state.snapshotCount == 0)
-                }
+                .controlSize(.small)
             }
 
             section("关于") {
@@ -235,12 +244,12 @@ struct SettingsView: View {
                     Text("Token查询")
                         .font(.system(size: 12))
                     Spacer()
-                    Text("v1.10")
+                    Text("v2.0")
                         .font(.system(size: 11))
                         .foregroundStyle(.tertiary)
                 }
-                Text("余额来自 DeepSeek 官方接口，消耗趋势由本机快照推算。"
-                     + "Codex 额度来自 Codex 自己的后端接口（非官方公开 API）。"
+                Text("监控 Grok、Codex、Gemini Pro 三家的额度余量。"
+                     + "三家的接口都不是官方公开 API，改版后可能失效。"
                      + "所有数据只存在你的电脑上。")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)

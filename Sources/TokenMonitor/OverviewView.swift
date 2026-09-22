@@ -2,25 +2,19 @@ import SwiftUI
 
 /// 总览页：把**所有服务商**的额度并到一屏里。
 ///
-/// 之前这里是「当前选中账号的详情」—— 选中的是 DeepSeek 就看不到 Codex，反之亦然。
-/// 但「总览」的意义本来就是一眼看到全部，所以改成按服务商分区块并列，
-/// 每个区块各带自己的「实时查询」按钮。
-///
-/// 「选中账号」现在只影响三处：菜单栏的「当前账号」模式、趋势页、
-/// 以及有多个 DeepSeek 账号时总览展示哪一个。
+/// 结构上刻意做成「按服务商分组、每组若干账号卡片」的通用形状 ——
+/// 每张卡片里有多少个额度窗口就画多少个环形图，不为某一家写特例。
+/// Grok 目前只有 1 个窗口（周），Codex / Gemini 通常有 2 个（5 小时 + 周）。
 struct OverviewView: View {
     @EnvironmentObject var state: AppState
 
     /// 正在查询的账号集合。
     ///
-    /// 用集合而不是一个 Bool：总览里 DeepSeek 和 Codex 各有一个按钮，
+    /// 用集合而不是一个 Bool：总览里每个账号各有一个按钮，
     /// 共用一个状态会变成「点其中一个、另一个也跟着转」。
     @LocalState private var queryingIDs: Set<UUID> = []
     /// 转一圈的时长。查询快于这个时长时，也会把这一圈转完再停。
     private let spinPeriod: TimeInterval = 0.9
-
-    private var enabledDeepseek: [APIAccount] { state.deepseekAccounts.filter(\.isEnabled) }
-    private var enabledCodex: [APIAccount] { state.codexAccounts.filter(\.isEnabled) }
 
     var body: some View {
         Group {
@@ -28,9 +22,9 @@ struct OverviewView: View {
                 EmptyHint(
                     icon: "plus.circle",
                     title: "还没有添加账号",
-                    message: "到「账号」页添加一个 DeepSeek API Key 或 Codex 账号，\n就能开始监控额度了。"
+                    message: "到「账号」页添加 Grok、Codex 或 Gemini Pro 账号，\n就能开始监控额度了。"
                 )
-            } else if enabledDeepseek.isEmpty && enabledCodex.isEmpty {
+            } else if state.enabledAccounts.isEmpty {
                 EmptyHint(
                     icon: "pause.circle",
                     title: "账号都已停用",
@@ -42,316 +36,255 @@ struct OverviewView: View {
         }
     }
 
-    /// 总览 = 全部服务商并列，不再只显示「当前选中账号」。
     private var dashboard: some View {
         VStack(alignment: .leading, spacing: 16) {
-            if let account = deepseekAccount {
-                deepseekSection(account)
+            ForEach(Provider.allCases) { provider in
+                providerSection(provider)
             }
-            if !enabledCodex.isEmpty {
-                codexSection
-            } else if state.codexAccounts.isEmpty, CodexAuthStore.isInstalled {
-                // 本机装了 Codex 但账号列表里没有 —— 给个一键导入的入口。
-                // 这块原来是 Codex 页签里的空状态，页签去掉后挪到这里。
-                codexImportSection
-            }
-        }
-    }
-
-    /// 总览里展示哪个 DeepSeek 账号：选中的那个优先，否则第一个已启用的。
-    private var deepseekAccount: APIAccount? {
-        if let selected = state.selectedAccount,
-           selected.provider == .deepseek,
-           selected.isEnabled {
-            return selected
-        }
-        return enabledDeepseek.first
-    }
-
-    // MARK: - 区块标题
-
-    private func sectionHeader(_ title: String, trailing: String? = nil) -> some View {
-        HStack(spacing: 6) {
-            Text(title)
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.secondary)
-            Spacer(minLength: 4)
-            if let trailing {
-                Text(trailing)
+            // 三家都是非官方接口，与其在每张卡片下面各说一遍，不如底部统一说一次
+            if !state.enabledAccounts.isEmpty {
+                Text("三家接口都不是官方公开 API，厂商改版后可能失效。数据只存在本机。")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
-                    .lineLimit(1)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 2)
             }
         }
     }
 
-    // MARK: - DeepSeek（金额）
+    // MARK: - 服务商分组
 
     @ViewBuilder
-    private func deepseekSection(_ account: APIAccount) -> some View {
-        let balance = state.balances[account.id]
-        let todayCost = state.todayCost(for: account.id)
-        let monthCost = state.monthCost(for: account.id)
-        let daysLeft = state.estimatedDaysRemaining(for: account.id)
+    private func providerSection(_ provider: Provider) -> some View {
+        let enabled = state.enabledAccounts(of: provider)
+        let anyAccount = state.accounts.contains { $0.provider == provider }
 
-        VStack(alignment: .leading, spacing: 10) {
-            sectionHeader(
-                "DeepSeek 余额",
-                // 只有一个 DeepSeek 账号时不必重复账号名 —— 面板顶部已经写了
-                trailing: enabledDeepseek.count > 1 ? account.name : nil
-            )
-
-            if enabledDeepseek.count > 1 {
-                deepseekTotalBlock
-            }
-
-            balanceBlock(balance, account: account)
-
-            HStack(spacing: 8) {
-                MetricCard(
-                    label: "今日消耗",
-                    value: "¥" + formatMoney(todayCost),
-                    tint: todayCost > 0 ? .primary : .secondary
+        if !enabled.isEmpty {
+            VStack(alignment: .leading, spacing: 10) {
+                sectionHeader(
+                    "\(provider.displayName) 额度",
+                    trailing: enabled.count > 1 ? "\(enabled.count) 个账号" : nil
                 )
-                MetricCard(label: "本月消耗", value: "¥" + formatMoney(monthCost))
-            }
-
-            if let daysLeft, daysLeft < 999 {
-                HStack(spacing: 6) {
-                    Image(systemName: "clock")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                    Text("按近 14 天消耗速度，余额大约还能用 \(String(format: "%.0f", daysLeft)) 天")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                ForEach(enabled) { account in
+                    accountCard(account)
                 }
             }
-
-            miniTrend(account: account)
+        } else if !anyAccount, let hint = importHint(for: provider) {
+            importSection(provider: provider, hint: hint)
         }
     }
 
-    private var deepseekTotalBlock: some View {
-        HStack(alignment: .center, spacing: 8) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("DeepSeek 余额合计")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                Text("¥" + formatMoney(state.deepseekTotalBalance))
-                    .font(.system(size: 16, weight: .medium, design: .monospaced))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.7)
-            }
-            Spacer(minLength: 6)
-            Text("\(enabledDeepseek.count) 个账号")
-                .font(.system(size: 11))
-                .foregroundStyle(.tertiary)
+    /// 本机装了但还没加进账号列表时，给一个一键导入入口
+    private func importHint(for provider: Provider) -> (title: String, detail: String, action: String)? {
+        switch provider {
+        case .grok:
+            guard GrokAuthStore.hasDefaultCredential else { return nil }
+            return ("检测到本机已登录 Grok CLI", "导入之后额度会显示在这里和菜单栏。", "导入")
+        case .codex:
+            guard CodexAuthStore.hasDefaultCredential else { return nil }
+            return ("检测到本机已登录 Codex", "导入之后额度会显示在这里和菜单栏。", "导入")
+        case .gemini:
+            guard state.geminiAvailable else { return nil }
+            return ("检测到本机正在运行 Antigravity", "添加后 Gemini Pro 额度会显示在这里和菜单栏。", "添加")
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 9)
-        .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color(nsColor: .controlBackgroundColor))
-        )
     }
 
-    // MARK: - Codex（百分比）
-
-    private var codexSection: some View {
+    private func importSection(provider: Provider,
+                               hint: (title: String, detail: String, action: String)) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            sectionHeader(
-                "Codex 额度",
-                trailing: enabledCodex.count > 1 ? "\(enabledCodex.count) 个账号" : nil
-            )
-            ForEach(enabledCodex) { account in
-                codexAccountCard(account)
-            }
-            Text("Codex 非官方接口，改版后可能失效。")
-                .font(.system(size: 10))
-                .foregroundStyle(.tertiary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-    }
-
-    /// 本机装了 Codex、但账号列表里还没有它时显示的导入入口
-    private var codexImportSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            sectionHeader("Codex 额度")
+            sectionHeader("\(provider.displayName) 额度")
             HStack(alignment: .center, spacing: 8) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("检测到本机已登录 Codex")
+                    Text(hint.title)
                         .font(.system(size: 12, weight: .medium))
-                    Text("导入之后额度会显示在这里和菜单栏。")
+                    Text(hint.detail)
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 6)
-                Button("导入") {
-                    state.addLocalCodexAccount()
-                }
-                .controlSize(.small)
+                Button(hint.action) { importLocal(provider) }
+                    .controlSize(.small)
             }
             .padding(10)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(Color(nsColor: .controlBackgroundColor))
-            )
+            .background(cardBackground)
         }
     }
 
-    /// 单个 Codex 账号的紧凑卡片：名称 + 套餐徽章 + 剩余百分比 + 额度条 + 重置时间，
-    /// 右上角是这个账号自己的「实时查询」按钮。
-    private func codexAccountCard(_ account: APIAccount) -> some View {
+    private func importLocal(_ provider: Provider) {
+        switch provider {
+        case .grok:   state.addLocalGrokAccount()
+        case .codex:  state.addLocalCodexAccount()
+        case .gemini: state.addLocalGeminiAccount()
+        }
+    }
+
+    // MARK: - 账号卡片
+
+    private func accountCard(_ account: APIAccount) -> some View {
         let balance = state.balances[account.id]
-        let usage = balance?.codexUsage
+        let windows = balance?.quotaWindows ?? []
 
-        return VStack(alignment: .leading, spacing: 7) {
-            HStack(spacing: 6) {
-                Text(account.name)
-                    .font(.system(size: 12, weight: .medium))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+        return VStack(alignment: .leading, spacing: 9) {
+            headerRow(account: account, balance: balance)
 
-                if let plan = usage?.planType, !plan.isEmpty {
-                    Text(planDisplayName(plan))
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 1)
-                        .background(
-                            Capsule(style: .continuous)
-                                .fill(Color.secondary.opacity(0.14))
-                        )
+            ringRow(account: account, balance: balance, windows: windows)
+
+            if let balance, balance.hasValue {
+                if balance.isLimitReached {
+                    limitReachedLine(for: account)
                 }
-
-                Spacer(minLength: 4)
-
-                queryButton(for: account)
+                details(for: account, balance: balance)
             }
 
-            // 主指标：剩余百分比
-            HStack(alignment: .firstTextBaseline, spacing: 5) {
-                if let balance, balance.hasValue, let percent = balance.remainingPercent {
-                    Text("\(Int(percent.rounded()))%")
-                        // 不用 design: .monospaced —— SF Mono 的数字 0 带斜杠，
-                        // 「0%」会读成「Ø%」。monospacedDigit 一样对齐，没这个问题。
-                        .font(.system(size: 22, weight: .medium).monospacedDigit())
-                        .foregroundStyle(balance.isStale ? Color.secondary : CodexStyle.tint(for: percent))
-                        .lineLimit(1)
-                    Text("剩余")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                    Spacer(minLength: 4)
-                    if balance.isLimitReached {
-                        Text("已用完")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(.red)
-                    }
-                } else if balance?.errorMessage != nil {
-                    Text("—")
-                        .font(.system(size: 22, weight: .medium).monospacedDigit())
-                        .foregroundStyle(.tertiary)
-                    Spacer(minLength: 4)
-                } else {
-                    ProgressView().controlSize(.small)
-                    Spacer(minLength: 4)
-                }
-            }
-
-            if let balance, balance.hasValue, let percent = balance.remainingPercent {
-                CodexProgressBar(remainingPercent: percent)
-            }
-
-            // 重置时间。带上窗口长度，否则「重置」没有时间尺度。
-            if let usage, let hint = resetHint(usage) {
-                Text(primaryWindowLabel(usage).map { "\($0) · \(hint)" } ?? hint)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            // 第二个窗口：主指标只反映最紧张的那个，另一个得单独列出来
-            if let secondary = usage?.secondary {
-                detailRow(secondary.windowLabel,
-                          trailing: "已用 \(Int(secondary.usedPercent.rounded()))%"
-                                  + " · 剩余 \(Int(secondary.remainingPercent.rounded()))%")
-            }
-
-            // 额外额度。免费版通常没有，有值才显示。
-            if let credits = usage?.credits, credits.unlimited || credits.hasCredits {
-                detailRow("额外额度",
-                          trailing: credits.unlimited
-                              ? "不限量"
-                              : (credits.balance.map { "$" + String(format: "%.2f", $0) } ?? "有可用额度"))
-            }
-
-            // 服务端熔断时说明「只能等重置」—— 免费版尤其需要这一句，
-            // 否则用户会去界面里找根本不存在的「充值」入口。
-            if balance?.isLimitReached == true, usage?.planType?.lowercased() == "free" {
-                Text("免费版没有额外额度可买，只能等重置。")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            // 凭据到期：粘贴 token 的账号只有约 10 天有效期，这个日期是刚需
-            if let expiry = state.codexAuthSummary(for: account)?.expiresAt {
-                Text("登录凭据 \(expiry.formatted(date: .numeric, time: .omitted)) 到期")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
-            }
-
-            // 错误：有旧值就先标「已过期」，别让用户以为这是刚取到的数
-            if let error = balance?.codexError {
-                if balance?.hasValue == true {
-                    warningLine(title: "额度可能已过期", detail: error.errorDescription ?? "")
-                } else {
-                    warningLine(title: error.errorDescription, detail: error.suggestion)
-                }
-            } else if let message = balance?.errorMessage, balance?.hasValue != true {
-                warningLine(title: nil, detail: message)
-            }
+            errorLine(balance: balance)
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color(nsColor: .controlBackgroundColor))
-        )
+        .background(cardBackground)
     }
 
-    /// 「10月11日 11:41 重置（还有 26 天 20 小时）」
-    private func resetHint(_ usage: CodexUsage?) -> String? {
-        guard let usage else { return nil }
-        let now = Date()
-        let upcoming = [usage.primary, usage.secondary]
-            .compactMap { $0?.resetsAt }
-            .filter { $0 > now }
-            .min()
-        guard let next = upcoming else { return nil }
-
-        let formatter = DateFormatter()
-        formatter.dateFormat = "M月d日 HH:mm"
-        let parts = Calendar.current.dateComponents([.day, .hour], from: now, to: next)
-        let days = parts.day ?? 0
-        let hours = parts.hour ?? 0
-        let left = days > 0 ? "还有 \(days) 天 \(hours) 小时" : "还有 \(hours) 小时"
-        return "\(formatter.string(from: next)) 重置（\(left)）"
-    }
-
-    /// 主窗口的长度说明（如「30 天窗口」）。
-    /// 接口偶尔不给窗口长度，这时 `windowLabel` 会退化成没有信息量的「额度窗口」，
-    /// 那就不显示了。
-    private func primaryWindowLabel(_ usage: CodexUsage) -> String? {
-        guard let primary = usage.primary, primary.windowSeconds > 0 else { return nil }
-        return primary.windowLabel
-    }
-
-    /// 一行「左标签 ——— 右说明」，用于多窗口 / 额外额度这类明细
-    private func detailRow(_ label: String, trailing: String) -> some View {
+    private func headerRow(account: APIAccount, balance: AccountBalance?) -> some View {
         HStack(spacing: 6) {
+            Text(account.name)
+                .font(.system(size: 12, weight: .medium))
+                .lineLimit(1)
+                .truncationMode(.middle)
+
+            if let plan = planBadge(account: account, balance: balance) {
+                Text(plan)
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Capsule(style: .continuous).fill(Color.secondary.opacity(0.14)))
+            }
+
+            Spacer(minLength: 4)
+
+            queryButton(for: account)
+        }
+    }
+
+    private func planBadge(account: APIAccount, balance: AccountBalance?) -> String? {
+        guard account.provider == .codex,
+              let plan = balance?.codexUsage?.planType, !plan.isEmpty else { return nil }
+        return planDisplayName(plan)
+    }
+
+    /// 环形图那一行：有几个窗口画几个环，左对齐。
+    @ViewBuilder
+    private func ringRow(account: APIAccount,
+                         balance: AccountBalance?,
+                         windows: [QuotaWindow]) -> some View {
+        if let balance, balance.hasValue, !windows.isEmpty {
+            HStack(alignment: .top, spacing: 10) {
+                ForEach(windows) { window in
+                    QuotaRing(
+                        title: window.title,
+                        remainingPercent: window.remainingPercent,
+                        resetHint: QuotaFormat.resetHint(window.resetsAt),
+                        isStale: balance.isStale,
+                        isLimitReached: balance.isLimitReached && window.remainingPercent <= 0.5
+                    )
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.top, 2)
+        } else {
+            // 三种情况都退到占位环，别让卡片塌成一条线
+            HStack(spacing: 10) {
+                QuotaRingPlaceholder(title: placeholderTitle(balance))
+                Spacer(minLength: 0)
+            }
+            .padding(.top, 2)
+        }
+    }
+
+    /// 占位环上的文案要分清三种状态：还没查到 / 查询失败 / 查到了但接口一个窗口都没给。
+    /// 都写成「正在获取」会让失败的那张卡片永远在转圈，看不出其实是报错了。
+    private func placeholderTitle(_ balance: AccountBalance?) -> String {
+        if balance?.hasValue == true { return "无窗口数据" }
+        if balance?.errorMessage != nil { return "无数据" }
+        return "正在获取"
+    }
+
+    /// 服务端明确熔断时的提示。必须给「什么时候恢复」，否则用户只能干等。
+    private func limitReachedLine(for account: APIAccount) -> some View {
+        let reset = state.balances[account.id]?.nextReset
+        let text: String
+        if let detail = QuotaFormat.resetDetail(reset) {
+            text = "额度已用完，\(detail)后恢复。"
+        } else {
+            text = "额度已用完，等窗口重置后恢复。"
+        }
+        return HStack(alignment: .top, spacing: 6) {
+            Image(systemName: "exclamationmark.octagon.fill")
+                .font(.system(size: 11))
+                .foregroundStyle(.red)
+            Text(text)
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    // MARK: - 各家的附加明细
+
+    @ViewBuilder
+    private func details(for account: APIAccount, balance: AccountBalance) -> some View {
+        switch account.provider {
+        case .grok:
+            grokDetails(balance: balance)
+        case .codex:
+            codexDetails(account: account, balance: balance)
+        case .gemini:
+            EmptyView()
+        }
+    }
+
+    /// Grok：周额度的产品拆分。
+    /// 服务端只给数字 id，没有可读名字，所以能确定的才起名，其余显示成「分项 N」。
+    @ViewBuilder
+    private func grokDetails(balance: AccountBalance) -> some View {
+        if let products = balance.grokUsage?.products, products.count > 1 {
+            let text = products
+                .map { "\($0.displayName) \(Int($0.usedPercent.rounded()))%" }
+                .joined(separator: " · ")
+            detailRow("额度分项", trailing: text)
+        }
+    }
+
+    /// Codex：额外额度 + 凭据到期日
+    @ViewBuilder
+    private func codexDetails(account: APIAccount, balance: AccountBalance) -> some View {
+        if let credits = balance.codexUsage?.credits, credits.unlimited || credits.hasCredits {
+            detailRow("额外额度",
+                      trailing: credits.unlimited
+                          ? "不限量"
+                          : (credits.balance.map { "$" + String(format: "%.2f", $0) } ?? "有可用额度"))
+        }
+
+        // 服务端熔断时说明「只能等重置」—— 免费版尤其需要这一句，
+        // 否则用户会去界面里找根本不存在的「充值」入口。
+        if balance.isLimitReached, balance.codexUsage?.planType?.lowercased() == "free" {
+            Text("免费版没有额外额度可买，只能等重置。")
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+
+        // 凭据到期：粘贴 token 的账号只有约 10 天有效期，这个日期是刚需
+        if let expiry = state.codexAuthSummary(for: account)?.expiresAt {
+            Text("登录凭据 \(expiry.formatted(date: .numeric, time: .omitted)) 到期")
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+        }
+    }
+
+    /// 一行「左标签 ——— 右说明」
+    private func detailRow(_ label: String, trailing: String) -> some View {
+        HStack(alignment: .top, spacing: 6) {
             Text(label)
                 .font(.system(size: 10))
                 .foregroundStyle(.secondary)
@@ -359,53 +292,46 @@ struct OverviewView: View {
             Text(trailing)
                 .font(.system(size: 10).monospacedDigit())
                 .foregroundStyle(.secondary)
+                .multilineTextAlignment(.trailing)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
-    // MARK: - 额度大字
+    // MARK: - 错误行
 
     @ViewBuilder
-    private func balanceBlock(_ balance: AccountBalance?, account: APIAccount) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(alignment: .center, spacing: 8) {
-                if let balance, balance.hasValue {
-                    Text(balance.displayValue)
-                        // 用默认字体的等宽数字，而不是 design: .monospaced：
-                        // 后者是 SF Mono，数字 0 带斜杠，30pt 下「0%」会读成「Ø%」。
-                        .font(.system(size: 30, weight: .medium).monospacedDigit())
-                        // 刷新失败时保留数值但压暗，和实时数据区分开
-                        .foregroundStyle(balance.isStale ? Color.secondary : Color.primary)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.6)
-                } else if balance?.errorMessage != nil {
-                    Text("—")
-                        .font(.system(size: 30, weight: .medium).monospacedDigit())
-                        .foregroundStyle(.tertiary)
-                } else {
-                    ProgressView().controlSize(.small)
-                }
-
-                Spacer(minLength: 4)
-
-                queryButton(for: account)
-            }
-
-            if let balance, balance.hasValue {
-                Text("充值 ¥\(formatMoney(balance.toppedUpBalance)) · 赠送 ¥\(formatMoney(balance.grantedBalance))")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-            } else if let balance, let error = balance.errorMessage {
-                warningLine(title: nil, detail: error)
+    private func errorLine(balance: AccountBalance?) -> some View {
+        if let balance, let error = balance.structuredError {
+            if balance.hasValue {
+                // 有旧值就先标「已过期」，别让用户以为这是刚取到的数
+                warningLine(title: "额度可能已过期", detail: error.title)
             } else {
-                Text("正在获取…")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
+                warningLine(title: error.title, detail: error.suggestion ?? "")
             }
+        } else if let message = balance?.errorMessage, balance?.hasValue != true {
+            warningLine(title: nil, detail: message)
+        }
+    }
 
-            if let balance, balance.hasValue, let error = balance.errorMessage {
-                warningLine(title: "额度可能已过期", detail: error)
+    private func warningLine(title: String?, detail: String) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 11))
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 1) {
+                if let title {
+                    Text(title)
+                        .font(.system(size: 11, weight: .medium))
+                }
+                if !detail.isEmpty {
+                    Text(detail)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
+        .padding(.vertical, 2)
     }
 
     // MARK: - 即时查询
@@ -437,9 +363,7 @@ struct OverviewView: View {
         }
         .buttonStyle(.plain)
         .disabled(busy)
-        .help(account.provider.isPercentBased
-              ? "立即向 Codex 查询这个账号的额度"
-              : "立即向 DeepSeek 查询这个账号的当前余额")
+        .help("立即向 \(account.provider.displayName) 查询这个账号的额度")
     }
 
     /// 转圈图标。
@@ -473,7 +397,7 @@ struct OverviewView: View {
 
         Task { @MainActor in
             let started = Date()
-            // force: 绕过 Codex 的失败退避 —— 用户手点的就该真的发一次
+            // force: 绕过失败退避 —— 用户手点的就该真的发一次
             await state.refresh(account, force: true)
 
             // 查得太快也把这一圈转完再停，否则动画一闪而过，等于没有反馈
@@ -485,59 +409,25 @@ struct OverviewView: View {
         }
     }
 
-    private func warningLine(title: String?, detail: String) -> some View {
-        HStack(alignment: .top, spacing: 6) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 11))
-                .foregroundStyle(.orange)
-            VStack(alignment: .leading, spacing: 1) {
-                if let title {
-                    Text(title)
-                        .font(.system(size: 11, weight: .medium))
-                }
-                Text(detail)
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-        .padding(.vertical, 2)
-    }
+    // MARK: - 小组件
 
-    // MARK: - 迷你趋势
-
-    private func miniTrend(account: APIAccount) -> some View {
-        let costs = state.dailyCosts(for: account.id, days: 7)
-        let maxCost = max(costs.map(\.cost).max() ?? 0, 0.0001)
-
-        return VStack(alignment: .leading, spacing: 6) {
-            Text("近 7 天消耗")
-                .font(.system(size: 11))
+    private func sectionHeader(_ title: String, trailing: String? = nil) -> some View {
+        HStack(spacing: 6) {
+            Text(title)
+                .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(.secondary)
-
-            HStack(alignment: .bottom, spacing: 5) {
-                ForEach(costs) { item in
-                    VStack(spacing: 4) {
-                        RoundedRectangle(cornerRadius: 2, style: .continuous)
-                            .fill(item.cost > 0
-                                  ? Color.accentColor.opacity(0.8)
-                                  : Color.secondary.opacity(0.18))
-                            .frame(height: max(3, 38 * item.cost / maxCost))
-                        Text(shortWeekday(item.day))
-                            .font(.system(size: 9))
-                            .foregroundStyle(.tertiary)
-                    }
-                    .frame(maxWidth: .infinity)
-                }
+            Spacer(minLength: 4)
+            if let trailing {
+                Text(trailing)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
             }
-            .frame(height: 54, alignment: .bottom)
         }
     }
 
-    private func shortWeekday(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "zh_CN")
-        formatter.dateFormat = "EEEEE"
-        return formatter.string(from: date)
+    private var cardBackground: some View {
+        RoundedRectangle(cornerRadius: 8, style: .continuous)
+            .fill(Color(nsColor: .controlBackgroundColor))
     }
 }

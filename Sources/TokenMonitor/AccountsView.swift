@@ -11,18 +11,18 @@ struct AccountsView: View {
                 EmptyHint(
                     icon: "key",
                     title: "还没有账号",
-                    message: "可以添加 DeepSeek API Key 和 Codex 账号，\n每个账号独立显示额度与预警。",
+                    message: "可以添加 Grok、Codex 和 Gemini Pro 账号，\n每个账号独立显示额度与预警。",
                     actionTitle: "添加账号",
                     action: onAdd
                 )
-                importLocalCodexButton
+                importButtons
             } else {
                 ForEach(state.accounts) { account in
                     row(account)
                 }
 
                 addButton
-                importLocalCodexButton
+                importButtons
             }
         }
     }
@@ -46,39 +46,66 @@ struct AccountsView: View {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .fill(Color(nsColor: .controlBackgroundColor))
         )
-        .help("添加 DeepSeek API Key，或在编辑器里把服务商切换成 Codex")
+        .help("添加 Grok、Codex 或 Gemini Pro 账号")
     }
 
-    /// 一键把本机的 Codex 登录加进来。
-    /// 已经加过就不显示 —— 免得出现两个指向同一个 auth.json 的账号。
+    /// 一键把本机已登录的服务加进来。已经加过的就不显示。
     @ViewBuilder
-    private var importLocalCodexButton: some View {
-        let target = CodexAuthStore.defaultAuthFileURL
-        let alreadyAdded = state.accounts.contains {
-            $0.isCodex && $0.credentialKind == .authFile && $0.resolvedAuthURL.path == target.path
+    private var importButtons: some View {
+        let grokTarget = GrokAuthStore.defaultAuthFileURL
+        let grokAdded = state.accounts.contains {
+            $0.provider == .grok && $0.credentialKind == .authFile
+                && $0.resolvedAuthURL.path == grokTarget.path
+        }
+        if !grokAdded, GrokAuthStore.hasDefaultCredential {
+            importButton(icon: "bolt.horizontal.circle", title: "导入本机 Grok",
+                         help: "把 ~/.grok/auth.json 作为一个 Grok 账号加入监控") {
+                state.addLocalGrokAccount()
+            }
         }
 
-        if !alreadyAdded && CodexAuthStore.hasDefaultCredential {
-            Button {
-                state.addLocalCodexAccount()
-            } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "arrow.down.doc")
-                        .font(.system(size: 10, weight: .semibold))
-                    Text("导入本机 Codex")
-                        .font(.system(size: 12))
-                }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 7)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(Color(nsColor: .controlBackgroundColor))
-            )
-            .help("把 ~/.codex/auth.json 作为一个 Codex 账号加入监控")
+        let codexTarget = CodexAuthStore.defaultAuthFileURL
+        let codexAdded = state.accounts.contains {
+            $0.provider == .codex && $0.credentialKind == .authFile
+                && $0.resolvedAuthURL.path == codexTarget.path
         }
+        if !codexAdded, CodexAuthStore.hasDefaultCredential {
+            importButton(icon: "arrow.down.doc", title: "导入本机 Codex",
+                         help: "把 ~/.codex/auth.json 作为一个 Codex 账号加入监控") {
+                state.addLocalCodexAccount()
+            }
+        }
+
+        let geminiAdded = state.accounts.contains { $0.provider == .gemini }
+        if !geminiAdded, state.geminiAvailable {
+            importButton(icon: "sparkles", title: "导入本机 Gemini Pro",
+                         help: "将本机 Antigravity 运行的 Gemini Pro 额度加入监控") {
+                state.addLocalGeminiAccount()
+            }
+        }
+    }
+
+    private func importButton(icon: String,
+                              title: String,
+                              help: String,
+                              action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Image(systemName: icon)
+                    .font(.system(size: 10, weight: .semibold))
+                Text(title)
+                    .font(.system(size: 12))
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 7)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color(nsColor: .controlBackgroundColor))
+        )
+        .help(help)
     }
 
     // MARK: - 账号行
@@ -100,14 +127,12 @@ struct AccountsView: View {
                         Text(account.name)
                             .font(.system(size: 12.5, weight: .medium))
                             .foregroundStyle(.primary)
-                        if account.provider.isPercentBased {
-                            Text("Codex")
-                                .font(.system(size: 9, weight: .medium))
-                                .padding(.horizontal, 4)
-                                .padding(.vertical, 1)
-                                .background(Capsule().fill(Color.secondary.opacity(0.15)))
-                                .foregroundStyle(.secondary)
-                        }
+                        Text(account.provider.displayName)
+                            .font(.system(size: 9, weight: .medium))
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Capsule().fill(Color.secondary.opacity(0.15)))
+                            .foregroundStyle(.secondary)
                     }
                     Text(subtitle(for: account))
                         .font(.system(size: 10))
@@ -120,10 +145,12 @@ struct AccountsView: View {
 
                 if let balance, balance.hasValue {
                     VStack(alignment: .trailing, spacing: 1) {
-                        Text(balance.displayValue)
-                            .font(.system(size: 12.5, weight: .medium, design: .monospaced))
+                        Text("\(Int((balance.remainingPercent ?? 0).rounded()))%")
+                            .font(.system(size: 12.5, weight: .medium).monospacedDigit())
                             // 刷新失败时保留上次数值，但压暗，避免被当成实时数据
-                            .foregroundStyle(balance.isStale ? Color.secondary : Color.primary)
+                            .foregroundStyle(balance.isStale
+                                             ? Color.secondary
+                                             : QuotaStyle.tint(for: balance.remainingPercent ?? 0))
                         if balance.isLimitReached {
                             Text("已用完")
                                 .font(.system(size: 9, weight: .medium))
@@ -196,16 +223,16 @@ struct AccountEditorView: View {
     let onDone: () -> Void
 
     @LocalState private var name: String = ""
-    @LocalState private var provider: Provider = .deepseek
+    @LocalState private var provider: Provider = .grok
     @LocalState private var apiKey: String = ""
-    @LocalState private var threshold: String = "10"
+    @LocalState private var threshold: String = "20"
     @LocalState private var enabled: Bool = true
     @LocalState private var test: TestState = .idle
 
-    // Codex 专用
-    @LocalState private var credentialKind: CodexCredentialKind = .authFile
+    // Grok / Codex 共用
+    @LocalState private var credentialKind: LocalCredentialKind = .authFile
     @LocalState private var authPath: String = ""
-    @LocalState private var codexAccountID: String = ""
+    @LocalState private var accountIDHint: String = ""
 
     /// 「测试连接」的结果
     enum TestState: Equatable {
@@ -245,7 +272,7 @@ struct AccountEditorView: View {
             }
 
             field("备注名称") {
-                TextField(provider == .codex ? "例如：Codex 小号" : "例如：主力 Key", text: $name)
+                TextField(placeholderName, text: $name)
                     .textFieldStyle(.roundedBorder)
             }
 
@@ -259,20 +286,19 @@ struct AccountEditorView: View {
                 .pickerStyle(.menu)
                 .onChange(of: provider) { _, newValue in
                     test = .idle
-                    // 新建时按服务商换一个合适的默认预警线：DeepSeek 是元，Codex 是百分比
+                    // 新建时按服务商换一个合适的默认预警线
                     if !isEditing {
-                        let fallback = newValue.isPercentBased
-                            ? AppState.defaultCodexThreshold
-                            : state.defaultAlertThreshold
+                        let fallback = state.defaultAlertThreshold
                         threshold = String(format: "%.0f", fallback)
                     }
+                    _ = newValue
                 }
             }
 
-            if provider == .codex {
-                codexFields
+            if provider.usesAuthFile {
+                localCredentialFields
             } else {
-                deepseekFields
+                geminiFields
             }
 
             HStack(spacing: 8) {
@@ -284,7 +310,7 @@ struct AccountEditorView: View {
             }
 
             field("低额度预警线（\(provider.thresholdUnit)）") {
-                TextField(provider == .codex ? "20" : "10", text: $threshold)
+                TextField("20", text: $threshold)
                     .textFieldStyle(.roundedBorder)
             }
 
@@ -294,9 +320,7 @@ struct AccountEditorView: View {
             }
 
             HStack {
-                Text(provider == .codex
-                     ? "凭据由 Codex 自己维护"
-                     : "Key 加密保存在本机数据目录")
+                Text(credentialFooterHint)
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
                 Spacer()
@@ -311,23 +335,29 @@ struct AccountEditorView: View {
         .onAppear(perform: prefill)
     }
 
-    // MARK: - DeepSeek 字段
-
-    @ViewBuilder
-    private var deepseekFields: some View {
-        field(isEditing ? "API Key（留空表示不修改）" : "API Key") {
-            SecureField("sk-…", text: $apiKey)
-                .textFieldStyle(.roundedBorder)
+    private var placeholderName: String {
+        switch provider {
+        case .grok:   return "例如：Grok 主力"
+        case .codex:  return "例如：Codex 小号"
+        case .gemini: return "例如：Gemini Pro 本机"
         }
     }
 
-    // MARK: - Codex 字段
+    private var credentialFooterHint: String {
+        switch provider {
+        case .grok:   return "凭据由 Grok CLI 自己维护"
+        case .codex:  return "凭据由 Codex 自己维护"
+        case .gemini: return "凭据由 Antigravity 自动提供"
+        }
+    }
+
+    // MARK: - Grok / Codex 字段
 
     @ViewBuilder
-    private var codexFields: some View {
+    private var localCredentialFields: some View {
         field("凭据来源") {
             Picker("", selection: $credentialKind) {
-                ForEach(CodexCredentialKind.allCases) { item in
+                ForEach(LocalCredentialKind.allCases) { item in
                     Text(item.displayName).tag(item)
                 }
             }
@@ -342,11 +372,11 @@ struct AccountEditorView: View {
         case .authFile:
             field("auth.json 路径") {
                 VStack(alignment: .leading, spacing: 5) {
-                    TextField("留空 = ~/.codex/auth.json", text: $authPath)
+                    TextField(defaultAuthPlaceholder, text: $authPath)
                         .textFieldStyle(.roundedBorder)
                     HStack(spacing: 6) {
                         Button("填入本机路径") {
-                            authPath = CodexAuthStore.defaultAuthFileURL.path
+                            authPath = defaultAuthURL.path
                             test = .idle
                         }
                         .controlSize(.small)
@@ -360,10 +390,7 @@ struct AccountEditorView: View {
                 }
             }
 
-            Text("要监控第二个 Codex 账号，先用另一个 CODEX_HOME 登录一次：\n"
-                 + "CODEX_HOME=~/.codex-work codex login\n"
-                 + "然后把 ~/.codex-work/auth.json 的路径填在上面。\n"
-                 + "这样 Codex 会自己续期，凭据长期有效。")
+            Text(authFileHelpText)
                 .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -373,17 +400,67 @@ struct AccountEditorView: View {
                 SecureField("粘一个 access_token", text: $apiKey)
                     .textFieldStyle(.roundedBorder)
             }
-            field("ChatGPT account id（可选）") {
-                TextField("可从 auth.json 的 tokens.account_id 复制", text: $codexAccountID)
-                    .textFieldStyle(.roundedBorder)
+
+            if provider == .codex {
+                field("ChatGPT account id（可选）") {
+                    TextField("可从 auth.json 的 tokens.account_id 复制", text: $accountIDHint)
+                        .textFieldStyle(.roundedBorder)
+                }
             }
-            Text("⚠️ 粘贴的 token 有效期约 10 天。本程序刻意不自动续期"
-                 + "（refresh_token 是轮换的，写错会破坏你自己的 Codex 登录），"
-                 + "所以到期后需要重新粘一次。长期使用建议改用 auth.json 方式。")
+
+            Text(pastedTokenWarning)
                 .font(.system(size: 10))
                 .foregroundStyle(.orange)
                 .fixedSize(horizontal: false, vertical: true)
         }
+    }
+
+    private var defaultAuthURL: URL {
+        provider == .grok ? GrokAuthStore.defaultAuthFileURL : CodexAuthStore.defaultAuthFileURL
+    }
+
+    private var defaultAuthPlaceholder: String {
+        provider == .grok ? "留空 = ~/.grok/auth.json" : "留空 = ~/.codex/auth.json"
+    }
+
+    private var authFileHelpText: String {
+        switch provider {
+        case .grok:
+            return "推荐这种方式。Grok 的 access_token 只有 6 小时有效期，"
+                + "用 auth.json 时本程序会在过期时自动帮它续期并写回，不用你管。"
+        case .codex:
+            return "要监控第二个 Codex 账号，先用另一个 CODEX_HOME 登录一次：\n"
+                + "CODEX_HOME=~/.codex-work codex login\n"
+                + "然后把 ~/.codex-work/auth.json 的路径填在上面。\n"
+                + "这样 Codex 会自己续期，凭据长期有效。"
+        default:
+            return ""
+        }
+    }
+
+    private var pastedTokenWarning: String {
+        switch provider {
+        case .grok:
+            return "⚠️ Grok 的 access_token 只有约 6 小时有效期，而且粘贴方式**无法自动续期**。"
+                + "除非只是临时用一下，否则建议改用 auth.json 方式。"
+        default:
+            return "⚠️ 粘贴的 token 有效期约 10 天。本程序刻意不自动续期"
+                + "（refresh_token 是轮换的，写错会破坏你自己的 Codex 登录），"
+                + "所以到期后需要重新粘一次。长期使用建议改用 auth.json 方式。"
+        }
+    }
+
+    // MARK: - Gemini 字段
+
+    @ViewBuilder
+    private var geminiFields: some View {
+        Text("Gemini Pro 额度通过本机运行的 Antigravity 语言服务器自动获取，"
+             + "不需要手动输入 API Key。\n\n"
+             + "请确保 Antigravity 桌面应用正在运行并已登录；"
+             + "没有运行时会显示「未检测到 Antigravity」。")
+            .font(.system(size: 10))
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     // MARK: - 测试连接
@@ -429,19 +506,13 @@ struct AccountEditorView: View {
     /// 编辑态下留空表示「不改」，所以只有新建时才要求必填
     private var canSubmit: Bool {
         guard !isEditing else { return true }
-        switch provider {
-        case .deepseek: return !trimmedKey.isEmpty
-        case .codex:
-            return credentialKind == .authFile ? true : !trimmedKey.isEmpty
-        }
+        guard provider.usesAuthFile else { return true }
+        return credentialKind == .authFile ? true : !trimmedKey.isEmpty
     }
 
     private var canTest: Bool {
-        switch provider {
-        case .deepseek: return !trimmedKey.isEmpty
-        case .codex:
-            return credentialKind == .authFile ? true : !trimmedKey.isEmpty
-        }
+        guard provider.usesAuthFile else { return true }
+        return credentialKind == .authFile ? true : !trimmedKey.isEmpty
     }
 
     // MARK: - 动作
@@ -453,26 +524,13 @@ struct AccountEditorView: View {
             threshold = String(format: "%.0f", account.alertThreshold)
             enabled = account.isEnabled
             credentialKind = account.credentialKind
-            authPath = account.codexAuthPath ?? ""
-            codexAccountID = account.codexAccountID ?? ""
+            authPath = account.authFilePath ?? ""
+            accountIDHint = account.accountIDHint ?? ""
         } else {
-            // 新账号的预警线取设置页里的默认值，而不是写死 10
+            // 新账号的预警线取设置页里的默认值，而不是写死
             threshold = String(format: "%.0f", state.defaultAlertThreshold)
         }
         DebugLog.write("编辑器就绪：\(isEditing ? "编辑" : "新建")，服务商=\(provider.displayName)，预警线=\(threshold)")
-    }
-
-    /// 把界面上的选择拼成一次请求要用的凭据
-    private func currentCredential() -> CodexCredential {
-        switch credentialKind {
-        case .authFile:
-            let url = trimmedPath.isEmpty
-                ? CodexAuthStore.defaultAuthFileURL
-                : URL(fileURLWithPath: (trimmedPath as NSString).expandingTildeInPath)
-            return .authFile(url)
-        case .pastedToken:
-            return .token(trimmedKey, accountID: codexAccountID.isEmpty ? nil : codexAccountID)
-        }
     }
 
     private func runTest() {
@@ -480,24 +538,31 @@ struct AccountEditorView: View {
         DebugLog.write("测试连接…服务商=\(provider.displayName)")
 
         switch provider {
-        case .deepseek:
-            let key = trimmedKey
+        case .grok:
+            let credential = currentGrokCredential()
             Task { @MainActor in
-                if let error = await BalanceService.shared.validate(apiKey: key, provider: provider) {
-                    test = .failure(error)
-                    DebugLog.write("测试连接失败：\(error)")
-                } else {
-                    test = .success("连接正常，Key 可用")
-                    DebugLog.write("测试连接成功")
+                do {
+                    let usage = try await GrokUsageService.shared.fetch(credential: credential)
+                    var detail = "连接正常"
+                    if let remaining = usage.lowestRemaining {
+                        detail += " · 剩余 \(Int(remaining.rounded()))%"
+                    }
+                    test = .success(detail)
+                    DebugLog.write("测试连接成功：\(detail)")
+                } catch let error as GrokError {
+                    test = .failure(error.errorDescription ?? "读取失败")
+                    DebugLog.write("测试连接失败：\(error.errorDescription ?? "未知")")
+                } catch {
+                    test = .failure(error.localizedDescription)
                 }
             }
 
         case .codex:
             // 粘贴模式且编辑态留空时，用已保存的凭据去测
-            var credential = currentCredential()
-            if case .token(let value, let accountID) = credential, value.isEmpty {
-                if let existing = account, case .found(let saved) = state.lookupCredential(existing.id) {
-                    credential = .token(saved, accountID: accountID ?? existing.codexAccountID)
+            var credential = currentCodexCredential()
+            if case .token(let value, let hint) = credential, value.isEmpty {
+                if let account, case .found(let saved) = state.lookupCredential(account.id) {
+                    credential = .token(saved, accountID: hint ?? account.accountIDHint)
                 }
             }
             Task { @MainActor in
@@ -517,6 +582,47 @@ struct AccountEditorView: View {
                     test = .failure(error.localizedDescription)
                 }
             }
+
+        case .gemini:
+            Task { @MainActor in
+                do {
+                    let usage = try await GeminiProService.shared.fetch()
+                    let remaining = [usage.primary, usage.secondary]
+                        .compactMap { $0?.remainingPercent }.min()
+                    var detail = "连接正常"
+                    if let remaining { detail += " · 剩余 \(Int(remaining.rounded()))%" }
+                    test = .success(detail)
+                    DebugLog.write("测试连接成功：\(detail)")
+                } catch {
+                    test = .failure(error.localizedDescription)
+                    DebugLog.write("测试连接失败：\(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    /// 把界面上的选择拼成一次请求要用的凭据
+    private func currentGrokCredential() -> GrokCredential {
+        switch credentialKind {
+        case .authFile:
+            let url = trimmedPath.isEmpty
+                ? GrokAuthStore.defaultAuthFileURL
+                : URL(fileURLWithPath: (trimmedPath as NSString).expandingTildeInPath)
+            return .authFile(url)
+        case .pastedToken:
+            return .token(trimmedKey)
+        }
+    }
+
+    private func currentCodexCredential() -> CodexCredential {
+        switch credentialKind {
+        case .authFile:
+            let url = trimmedPath.isEmpty
+                ? CodexAuthStore.defaultAuthFileURL
+                : URL(fileURLWithPath: (trimmedPath as NSString).expandingTildeInPath)
+            return .authFile(url)
+        case .pastedToken:
+            return .token(trimmedKey, accountID: accountIDHint.isEmpty ? nil : accountIDHint)
         }
     }
 
@@ -530,10 +636,10 @@ struct AccountEditorView: View {
             updated.provider = provider
             updated.alertThreshold = value
             updated.isEnabled = enabled
-            if provider == .codex {
-                updated.codexCredentialKind = credentialKind.rawValue
-                updated.codexAuthPath = trimmedPath.isEmpty ? nil : trimmedPath
-                updated.codexAccountID = codexAccountID.isEmpty ? nil : codexAccountID
+            if provider.usesAuthFile {
+                updated.credentialKind = credentialKind
+                updated.authFilePath = trimmedPath.isEmpty ? nil : trimmedPath
+                updated.accountIDHint = accountIDHint.isEmpty ? nil : accountIDHint
                 // 切到 auth.json 模式就把残留的 token 删掉，避免留一份用不上的密钥
                 if credentialKind == .authFile {
                     state.clearCredential(for: account.id)
@@ -542,17 +648,21 @@ struct AccountEditorView: View {
                     onDone()
                     return
                 }
+            } else {
+                updated.authFilePath = nil
+                updated.accountIDHint = nil
+                updated.keySuffix = ""
             }
             state.updateAccount(updated, newKey: trimmedKey.isEmpty ? nil : trimmedKey)
         } else {
             state.addAccount(
                 name: name,
                 provider: provider,
-                apiKey: trimmedKey,
+                apiKey: provider.usesAuthFile && credentialKind == .authFile ? "" : trimmedKey,
                 threshold: value,
-                codexAuthPath: trimmedPath.isEmpty ? nil : trimmedPath,
-                codexCredentialKind: credentialKind,
-                codexAccountID: codexAccountID.isEmpty ? nil : codexAccountID
+                authFilePath: trimmedPath.isEmpty ? nil : trimmedPath,
+                credentialKind: credentialKind,
+                accountIDHint: accountIDHint.isEmpty ? nil : accountIDHint
             )
         }
         onDone()

@@ -22,36 +22,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             AlertEngine.shared.requestAuthorization()
         }
     }
-
-    /// 快照写盘做了节流，退出前补一次，避免丢掉最后一段数据
-    func applicationWillTerminate(_ notification: Notification) {
-        SnapshotStore.shared.flush()
-    }
 }
 
-/// 菜单栏常驻标签：图标 + 余额数字
+/// 菜单栏常驻标签：图标 + **当前轮播到的那一家**的剩余百分比。
+///
+/// 之所以只显示一家：三家并排写成 `GR 37% · CX 20% · GP 85%` 太长，
+/// 菜单栏那一格会宽到把旁边的图标挤掉。改成轮流显示，颜色跟着它自己的额度状态走。
 struct MenuBarLabel: View {
     @ObservedObject var state: AppState
     @AppStorage("menuBarShowsBalance") private var showsBalance: Bool = true
-    @AppStorage("menuBarDisplayMode") private var displayMode: String = MenuBarDisplayMode.current.rawValue
 
-    private var mode: MenuBarDisplayMode {
-        MenuBarDisplayMode(rawValue: displayMode) ?? .current
-    }
-
-    private var status: MenuBarStatus { state.menuBarStatus(mode: mode) }
+    private var status: MenuBarStatus { state.menuBarStatus() }
 
     var body: some View {
         HStack(spacing: 3) {
             // 有彩色版本就用彩色图，取不到再退回普通符号（形状本身也能区分状态）
-            if let icon = MenuBarIcon.image(symbol: state.menuBarSymbol(mode: mode), status: status) {
+            if let icon = MenuBarIcon.image(symbol: state.menuBarSymbol(), status: status) {
                 Image(nsImage: icon)
             } else {
-                Image(systemName: state.menuBarSymbol(mode: mode))
+                Image(systemName: state.menuBarSymbol())
             }
 
-            if showsBalance && !state.menuBarText(mode: mode).isEmpty {
-                Text(state.menuBarText(mode: mode))
+            if showsBalance && !state.menuBarText().isEmpty {
+                Text(state.menuBarText())
                     // 用默认字体的等宽数字：design: .monospaced 是 SF Mono，
                     // 数字 0 带斜杠，菜单栏上「CX 0%」会读成「CX Ø%」。
                     .font(.system(size: 12, weight: .medium).monospacedDigit())
@@ -60,6 +53,8 @@ struct MenuBarLabel: View {
                     .fixedSize()
             }
         }
+        // 换一家时让文字和颜色过渡一下，否则每 5 秒硬切一次看着像在闪
+        .animation(.easeInOut(duration: 0.25), value: state.menuBarRotation)
     }
 }
 
@@ -67,24 +62,29 @@ struct MenuBarLabel: View {
 ///
 /// 菜单栏默认把标签内容当**模板图**处理 —— 只取 alpha，颜色会被抹掉。
 /// 所以这里把 SF Symbol 先画进一张自建 NSImage，用 sourceAtop 上色，再把 isTemplate 关掉。
+///
+/// 配色和环形图同口径（≥50% 绿 / ≥20% 橙 / <20% 红），
+/// 这样面板里 Grok 是橙环、菜单栏轮到 Grok 也是橙字，不会出现「同一个数字两个颜色」。
 @MainActor
 enum MenuBarIcon {
 
     static func color(for status: MenuBarStatus) -> Color {
         switch status {
-        case .normal: return .green
-        case .warning: return .yellow
-        case .error: return .red
-        case .loading: return .secondary
+        case .normal:   return .green
+        case .warning:  return .orange
+        case .critical: return .red
+        case .error:    return .red
+        case .loading:  return .secondary
         }
     }
 
     private static func nsColor(for status: MenuBarStatus) -> NSColor {
         switch status {
-        case .normal: return .systemGreen
-        case .warning: return .systemYellow
-        case .error: return .systemRed
-        case .loading: return .secondaryLabelColor
+        case .normal:   return .systemGreen
+        case .warning:  return .systemOrange
+        case .critical: return .systemRed
+        case .error:    return .systemRed
+        case .loading:  return .secondaryLabelColor
         }
     }
 

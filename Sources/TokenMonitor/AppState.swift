@@ -1,10 +1,22 @@
 import Foundation
 import SwiftUI
 
+/// 菜单栏的状态档位。
+///
+/// 和环形图共用同一套配色口径（`QuotaStyle.tint`）：**≥50% 绿 / ≥20% 橙 / <20% 红**。
+/// 之所以不是「有没有低于预警线」这种二值判断：面板里 Grok 37% 画的是橙环，
+/// 菜单栏轮到 Grok 却显示绿色的话，同一个数字两处两个颜色，会被当成两个不同的东西。
+/// 预警线（`alertThreshold`）只负责**发系统通知**，不再参与配色。
 enum MenuBarStatus {
+    /// ≥50%
     case normal
+    /// 20% ~ 50%
     case warning
+    /// <20%，或服务端已熔断
+    case critical
+    /// 取不到数（凭据失效、网络不通、对方应用没开）
     case error
+    /// 还没查到（首次刷新中）
     case loading
 }
 
@@ -15,72 +27,148 @@ final class AppState: ObservableObject {
     @Published var balances: [UUID: AccountBalance] = [:]
     @Published var isRefreshing = false
     @Published var lastRefresh: Date?
+    /// 「账号」页里高亮的那一行。
+    ///
+    /// 面板顶部原来有个「选择当前账号」的下拉，总览页跟着它走；总览改成按服务商
+    /// 一屏列出全部账号之后那个下拉就删了，所以这个值现在**只**用来在账号列表里做标记，
+    /// 不再影响总览显示什么。
     @Published var selectedAccountID: UUID?
     /// 预览用的临时 Key，只在内存里，保存时才进本地凭据文件
     @Published var editingKeyDraft: String = ""
     /// 凭据缺失或解不开、需要用户重新填入的账号
     @Published var accountsNeedingKey: Set<UUID> = []
+    /// 本机是否检测到 Antigravity。
+    ///
+    /// 之所以做成 @Published 的状态而不是让界面直接问 `AntigravityProbe.isRunning`：
+    /// 探测要起 `ps` 子进程并同步等待，而 SwiftUI 的 body 每次重绘都会执行 ——
+    /// 直接在 body 里探测等于每帧 fork 一个进程，面板会卡到没法用。
+    @Published var geminiAvailable = false
+
+    /// 菜单栏轮播到第几家（对启用中的服务商取模）。
+    ///
+    /// 三家并排写成 `GR 37% · CX 20% · GP 85%` 太长了，菜单栏那一格会被挤掉别的图标。
+    /// 改成轮流显示一家，每家的颜色跟着**它自己**的额度状态走。
+    @Published var menuBarRotation: Int = 0
+
+    /// 不轮播时固定显示哪一家，存 `Provider.rawValue`；空串 = 用轮播顺序的第一家。
+    ///
+    /// 做成 `@Published` 而不是每次去读 UserDefaults：改了之后菜单栏要**立刻**换人，
+    /// 而 `MenuBarLabel` 只监听 `@Published` 的变化，直接读 UserDefaults 它不会重绘。
+    @Published var menuBarPinnedProviderRaw: String = ""
+
+    private static let pinnedProviderKey = "menuBarPinnedProvider"
 
     private let accountStore = AccountStore()
     private let credentials = CredentialStore.shared
-    private let service = BalanceService.shared
-    private let snapshots = SnapshotStore.shared
     private var timer: Timer?
+    /// 菜单栏轮播的定时器，和刷新定时器分开 —— 两者周期不同（刷新按分钟，轮播按秒）
+    private var rotationTimer: Timer?
+
+    /// Grok 账号的默认预警线（剩余百分比）
+    static let defaultThreshold: Double = 20
 
     init() {
         accounts = accountStore.load()
-        seedLocalCodexIfNeeded()
+        menuBarPinnedProviderRaw = UserDefaults.standard.string(forKey: Self.pinnedProviderKey) ?? ""
+        seedLocalAccountsIfNeeded()
         selectedAccountID = accounts.first?.id
         refreshAccountsNeedingKey()
-        // 启动时留一条痕迹。「余额取不到」这类问题第一步就是看这里：
-        // 账号数对不对、有几个凭据需要重填、密钥是绑机器的还是存文件的。
-        DebugLog.write("启动 v1.10：账号 \(accounts.count) 个（DeepSeek \(deepseekAccounts.count) / Codex \(codexAccounts.count)），"
-                       + "需重填凭据 \(accountsNeedingKey.count) 个，\(credentials.bindingDescription)")
 
-        // 先刷一次让面板立刻有数据，再去做迁移。
-        // 顺序反过来的话，用户在钥匙串授权框前多停一会儿，面板就一直空着。
         Task { @MainActor in
+            // 探测 Antigravity 要起进程，放在这里而不是 init 里同步做，避免拖慢启动
+            await refreshGeminiAvailability()
+            seedLocalGeminiIfNeeded()
+            logStartup()
             await refreshAll()
             if await migrateLegacyCredentialsIfNeeded() {
                 await refreshAll()      // 迁移到了新凭据，再刷一次
             }
         }
         restartTimer()
+        restartRotationTimer()
     }
 
-    // MARK: - 首次运行自动导入本机 Codex
+    /// 启动时留一条痕迹。「额度取不到」这类问题第一步就是看这里：
+    /// 账号数对不对、有几个凭据需要重填、密钥是绑机器的还是存文件的。
+    private func logStartup() {
+        DebugLog.write("启动 v2.0：账号 \(accounts.count) 个（Grok \(grokAccounts.count)"
+                       + " / Codex \(codexAccounts.count) / Gemini \(geminiAccounts.count)），"
+                       + "需重填凭据 \(accountsNeedingKey.count) 个，\(credentials.bindingDescription)")
+    }
 
-    /// 把本机的 `~/.codex/auth.json` 自动收进账号列表。
-    ///
-    /// 为什么自动做：这个功能的需求原话是「菜单栏现在没有显示 codex 的额度」。
-    /// 本机已经登录过 Codex 的情况下，让用户先去点一次「添加账号」纯属多余 ——
-    /// 直接导入，它立刻出现在账号列表和菜单栏里。
-    ///
-    /// 用 UserDefaults 标记位保证只做一次：用户删掉这个账号之后不会再自己冒出来。
-    private func seedLocalCodexIfNeeded() {
+    /// 重新探测本机有没有 Antigravity。
+    /// 结果只在真的变了的时候才写回，免得每次自动刷新都无谓地触发一轮界面重绘。
+    func refreshGeminiAvailability() async {
+        let available = await Task.detached(priority: .utility) {
+            AntigravityProbe.isRunning
+        }.value
+        if geminiAvailable != available { geminiAvailable = available }
+    }
+
+    // MARK: - 首次运行自动导入本机服务
+
+    /// 本机装了哪个 CLI 就自动把哪个收进账号列表。
+    /// 只跑一次（UserDefaults 打标记），删掉之后不会再自己冒出来。
+    private func seedLocalAccountsIfNeeded() {
         let defaults = UserDefaults.standard
-        guard !defaults.bool(forKey: "codexAutoSeedDone") else { return }
-        defaults.set(true, forKey: "codexAutoSeedDone")
 
-        guard !accounts.contains(where: { $0.isCodex }) else { return }
-        guard CodexAuthStore.hasDefaultCredential else {
-            DebugLog.write("Codex 自动导入：本机没有可读的 auth.json，跳过")
+        if !defaults.bool(forKey: "grokAutoSeedDone") {
+            defaults.set(true, forKey: "grokAutoSeedDone")
+            if !accounts.contains(where: { $0.provider == .grok }) {
+                if GrokAuthStore.hasDefaultCredential {
+                    var account = APIAccount(name: "Grok（本机）",
+                                             provider: .grok,
+                                             alertThreshold: Self.defaultThreshold)
+                    account.credentialKind = .authFile
+                    accounts.append(account)
+                    accountStore.save(accounts)
+                    DebugLog.write("Grok 自动导入：已把 ~/.grok/auth.json 加入账号列表")
+                } else {
+                    DebugLog.write("Grok 自动导入：本机没有可读的 auth.json，跳过")
+                }
+            }
+        }
+
+        if !defaults.bool(forKey: "codexAutoSeedDone") {
+            defaults.set(true, forKey: "codexAutoSeedDone")
+            if !accounts.contains(where: { $0.provider == .codex }) {
+                if CodexAuthStore.hasDefaultCredential {
+                    var account = APIAccount(name: "Codex（本机）",
+                                             provider: .codex,
+                                             alertThreshold: Self.defaultThreshold)
+                    account.credentialKind = .authFile
+                    accounts.append(account)
+                    accountStore.save(accounts)
+                    DebugLog.write("Codex 自动导入：已把 ~/.codex/auth.json 加入账号列表")
+                } else {
+                    DebugLog.write("Codex 自动导入：本机没有可读的 auth.json，跳过")
+                }
+            }
+        }
+    }
+
+    /// 若本机运行着 Antigravity，自动把 Gemini Pro 加入账号列表
+    private func seedLocalGeminiIfNeeded() {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: "geminiAutoSeedDone") else { return }
+
+        guard !accounts.contains(where: { $0.provider == .gemini }) else {
+            defaults.set(true, forKey: "geminiAutoSeedDone")
+            return
+        }
+        guard geminiAvailable else {
+            DebugLog.write("Gemini 自动导入：本机未检测到 Antigravity，跳过")
             return
         }
 
-        var account = APIAccount(
-            name: "Codex（本机）",
-            provider: .codex,
-            alertThreshold: AppState.defaultCodexThreshold
-        )
-        account.codexCredentialKind = CodexCredentialKind.authFile.rawValue
+        defaults.set(true, forKey: "geminiAutoSeedDone")
+        let account = APIAccount(name: "Gemini Pro",
+                                 provider: .gemini,
+                                 alertThreshold: Self.defaultThreshold)
         accounts.append(account)
         accountStore.save(accounts)
-        DebugLog.write("Codex 自动导入：已把 ~/.codex/auth.json 加入账号列表")
+        DebugLog.write("Gemini 自动导入：已把 Gemini Pro 加入账号列表")
     }
-
-    /// Codex 账号的默认预警线（剩余百分比）
-    static let defaultCodexThreshold: Double = 20
 
     // MARK: - 定时刷新
 
@@ -97,6 +185,40 @@ final class AppState: ObservableObject {
         }
     }
 
+    // MARK: - 菜单栏轮播
+
+    /// 轮播间隔（秒）。0 = 不轮播，只显示最紧张的那一家。
+    /// UserDefaults 里没有这个键时给 5 秒 —— `integer(forKey:)` 读不到键会返回 0，
+    /// 那会跟「用户主动选了不轮播」混起来，所以要先判键在不在。
+    var menuBarRotateSeconds: Int {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: "menuBarRotateSeconds") != nil else { return 5 }
+        return defaults.integer(forKey: "menuBarRotateSeconds")
+    }
+
+    func restartRotationTimer() {
+        rotationTimer?.invalidate()
+        rotationTimer = nil
+        menuBarRotation = 0
+
+        let seconds = menuBarRotateSeconds
+        guard seconds > 0 else { return }
+        rotationTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(seconds),
+                                             repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.advanceMenuBarRotation() }
+        }
+    }
+
+    private func advanceMenuBarRotation() {
+        // 只有一家（或一家都没启用）时没必要轮播，省掉无谓的重绘
+        let count = menuBarProviders.count
+        guard count > 1 else {
+            if menuBarRotation != 0 { menuBarRotation = 0 }
+            return
+        }
+        menuBarRotation = (menuBarRotation + 1) % count
+    }
+
     // MARK: - 刷新
 
     func refreshAll() async {
@@ -107,6 +229,10 @@ final class AppState: ObservableObject {
             lastRefresh = Date()
         }
 
+        // 顺手更新一次 Antigravity 的存在性：用户可能是刷新的同时才把 Antigravity 打开，
+        // 总览里的「导入本机 Gemini Pro」入口要跟着出现。
+        await refreshGeminiAvailability()
+
         await withTaskGroup(of: Void.self) { group in
             for account in accounts where account.isEnabled {
                 group.addTask { @MainActor in
@@ -116,93 +242,85 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// Codex 请求失败后的退避截止时间。
+    /// 请求失败后的退避截止时间。
     ///
-    /// chatgpt.com 不可达时（国内直连就是这种情况），每 5 分钟的自动刷新都会失败，
-    /// debug.log 会被刷满、还白白发请求。失败后安静 15 分钟，手动刷新不受限制。
-    private var codexBackoffUntil: [UUID: Date] = [:]
-    private let codexBackoffInterval: TimeInterval = 15 * 60
+    /// 服务端不可达时（国内直连 chatgpt.com / grok.com 就是这种情况），
+    /// 每 5 分钟的自动刷新都会失败，debug.log 会被刷满、还白白发请求。
+    /// 失败后安静 15 分钟，手动刷新不受限制。
+    private var backoffUntil: [UUID: Date] = [:]
+    private let backoffInterval: TimeInterval = 15 * 60
 
     func refresh(_ account: APIAccount, force: Bool = false) async {
+        if !force, let until = backoffUntil[account.id], until > Date() { return }
+
         switch account.provider {
-        case .deepseek:
-            await refreshDeepSeek(account)
-        case .codex:
-            await refreshCodex(account, force: force)
+        case .grok:   await refreshGrok(account)
+        case .codex:  await refreshCodex(account)
+        case .gemini: await refreshGemini(account)
         }
     }
 
-    private func refreshDeepSeek(_ account: APIAccount) async {
-        let key: String
-        switch credentials.lookup(for: account.id) {
-        case .found(let value):
-            key = value
-        case .missing:
-            balances[account.id] = AccountBalance(
-                accountID: account.id,
-                errorMessage: "未设置 API Key"
-            )
-            return
-        case .undecryptable(let reason):
-            balances[account.id] = AccountBalance(
-                accountID: account.id,
-                errorMessage: "凭据无法解密（\(reason)），请重新填入 API Key"
-            )
-            accountsNeedingKey.insert(account.id)
-            return
-        }
-
-        do {
-            let payload = try await service.fetchBalance(apiKey: key, provider: account.provider)
-            guard let info = payload.balanceInfos.first(where: { $0.currency.uppercased() == "CNY" })
-                    ?? payload.balanceInfos.first else {
-                throw BalanceError.decoding
-            }
-
-            let balance = AccountBalance(
-                accountID: account.id,
-                totalBalance: Double(info.totalBalance) ?? 0,
-                grantedBalance: Double(info.grantedBalance) ?? 0,
-                toppedUpBalance: Double(info.toppedUpBalance) ?? 0,
-                currency: info.currency,
-                isAvailable: payload.isAvailable,
-                updatedAt: Date(),
-                successAt: Date(),
-                errorMessage: nil
-            )
-            balances[account.id] = balance
-
-            snapshots.append(BalanceSnapshot(
-                accountID: account.id,
-                timestamp: Date(),
-                totalBalance: balance.totalBalance,
-                grantedBalance: balance.grantedBalance,
-                toppedUpBalance: balance.toppedUpBalance,
-                currency: balance.currency
-            ))
-
-            AlertEngine.shared.evaluate(account: account, balance: balance)
-
-        } catch {
-            // 失败时保留上一次成功的金额，只把错误挂上去，界面会标成「数据已过期」
-            var previous = balances[account.id] ?? AccountBalance(accountID: account.id)
-            previous.errorMessage = error.localizedDescription
-            previous.updatedAt = Date()
-            balances[account.id] = previous
-        }
+    /// 统一处理「拿到额度 → 写状态 → 评估预警」，三个服务商共用。
+    private func applySuccess(_ account: APIAccount,
+                              remaining: Double?,
+                              limitReached: Bool,
+                              grok: GrokUsage? = nil,
+                              codex: CodexUsage? = nil,
+                              gemini: GeminiProUsage? = nil) {
+        let balance = AccountBalance(
+            accountID: account.id,
+            updatedAt: Date(),
+            successAt: Date(),
+            errorMessage: nil,
+            remainingPercent: remaining ?? 0,
+            isLimitReached: limitReached,
+            grokUsage: grok,
+            codexUsage: codex,
+            geminiUsage: gemini
+        )
+        balances[account.id] = balance
+        accountsNeedingKey.remove(account.id)
+        backoffUntil[account.id] = nil
+        AlertEngine.shared.evaluate(account: account, balance: balance)
     }
 
-    /// Codex 额度。凭据两种来源：auth.json 路径（Codex 自己续期）或用户粘贴的 token。
-    private func refreshCodex(_ account: APIAccount, force: Bool) async {
-        if !force, let until = codexBackoffUntil[account.id], until > Date() {
-            return
-        }
+    /// 统一处理失败：保留上一次的值，只把错误挂上去 —— 界面会标成「数据已过期」。
+    /// `treatAsTemporary` 为真时不退避（例如「对方应用没开」，用户随时可能打开）。
+    private func applyFailure(_ account: APIAccount,
+                              error: Error,
+                              message: String,
+                              temporary: Bool = false,
+                              grokError: GrokError? = nil,
+                              codexError: CodexUsageError? = nil,
+                              geminiError: GeminiProError? = nil) {
+        var previous = balances[account.id] ?? AccountBalance(accountID: account.id)
+        previous.errorMessage = message
+        previous.updatedAt = Date()
+        if let grokError { previous.grokError = grokError }
+        if let codexError { previous.codexError = codexError }
+        if let geminiError { previous.geminiError = geminiError }
+        balances[account.id] = previous
 
-        let credential: CodexCredential
+        backoffUntil[account.id] = temporary ? nil : Date().addingTimeInterval(backoffInterval)
+        DebugLog.write("「\(account.name)」额度读取失败：\(message)")
+    }
+
+    /// 清掉上一次的结构化错误（成功时不能留着旧错误，否则界面会一直显示告警）
+    private func clearErrors(_ id: UUID) {
+        guard var balance = balances[id] else { return }
+        balance.grokError = nil
+        balance.codexError = nil
+        balance.geminiError = nil
+        balances[id] = balance
+    }
+
+    // MARK: - Grok
+
+    private func refreshGrok(_ account: APIAccount) async {
+        let credential: GrokCredential
         switch account.credentialKind {
         case .authFile:
             credential = .authFile(account.resolvedAuthURL)
-
         case .pastedToken:
             guard case .found(let token) = credentials.lookup(for: account.id), !token.isEmpty else {
                 balances[account.id] = AccountBalance(
@@ -212,7 +330,54 @@ final class AppState: ObservableObject {
                 accountsNeedingKey.insert(account.id)
                 return
             }
-            credential = .token(token, accountID: account.codexAccountID)
+            credential = .token(token)
+        }
+
+        do {
+            let usage = try await GrokUsageService.shared.fetch(credential: credential)
+            clearErrors(account.id)
+            applySuccess(account,
+                         remaining: usage.lowestRemaining,
+                         limitReached: usage.limitReached,
+                         grok: usage)
+            DebugLog.write("Grok 额度「\(account.name)」："
+                           + "剩余=\(usage.lowestRemaining.map { String(format: "%.0f%%", $0) } ?? "无")，"
+                           + "窗口=\(usage.windows.map(\.windowLabel).joined(separator: " / "))")
+        } catch {
+            let grokError = error as? GrokError
+            // 「对方应用没开 / 没登录」是最常见的临时状态，不退避 ——
+            // 否则用户登录完还得干等 15 分钟才会再连一次。
+            let temporary: Bool
+            switch grokError {
+            case .notInstalled, .notLoggedIn, .authFileMissing, .tokenExpired: temporary = true
+            default: temporary = false
+            }
+            applyFailure(account,
+                         error: error,
+                         message: error.localizedDescription,
+                         temporary: temporary,
+                         grokError: grokError)
+        }
+    }
+
+    // MARK: - Codex
+
+    /// Codex 额度。凭据两种来源：auth.json 路径（Codex 自己续期）或用户粘贴的 token。
+    private func refreshCodex(_ account: APIAccount) async {
+        let credential: CodexCredential
+        switch account.credentialKind {
+        case .authFile:
+            credential = .authFile(account.resolvedAuthURL)
+        case .pastedToken:
+            guard case .found(let token) = credentials.lookup(for: account.id), !token.isEmpty else {
+                balances[account.id] = AccountBalance(
+                    accountID: account.id,
+                    errorMessage: "未设置 access_token"
+                )
+                accountsNeedingKey.insert(account.id)
+                return
+            }
+            credential = .token(token, accountID: account.accountIDHint)
         }
 
         do {
@@ -220,35 +385,48 @@ final class AppState: ObservableObject {
             let windows = [usage.primary, usage.secondary].compactMap { $0 }
             // 多窗口时取最紧张的那个作为账号级的「剩余」
             let remaining = windows.map(\.remainingPercent).min()
-
-            let balance = AccountBalance(
-                accountID: account.id,
-                updatedAt: Date(),
-                successAt: Date(),
-                errorMessage: nil,
-                remainingPercent: remaining ?? 0,
-                isLimitReached: usage.limitReached,
-                codexUsage: usage,
-                codexError: nil
-            )
-            balances[account.id] = balance
-            accountsNeedingKey.remove(account.id)
-            codexBackoffUntil[account.id] = nil
-            AlertEngine.shared.evaluate(account: account, balance: balance)
-
+            clearErrors(account.id)
+            applySuccess(account,
+                         remaining: remaining,
+                         limitReached: usage.limitReached,
+                         codex: usage)
             DebugLog.write("Codex 额度「\(account.name)」：套餐=\(usage.planType ?? "?")，"
                            + "剩余=\(remaining.map { String(format: "%.0f%%", $0) } ?? "无")，"
                            + "熔断=\(usage.limitReached)")
-
         } catch {
-            // 失败保留上次的数值，只把错误挂上去 —— 界面会显示「数据已过期」而不是清空
-            var previous = balances[account.id] ?? AccountBalance(accountID: account.id)
-            previous.errorMessage = error.localizedDescription
-            previous.codexError = error as? CodexUsageError
-            previous.updatedAt = Date()
-            balances[account.id] = previous
-            codexBackoffUntil[account.id] = Date().addingTimeInterval(codexBackoffInterval)
-            DebugLog.write("Codex 额度「\(account.name)」读取失败：\(error.localizedDescription)")
+            applyFailure(account,
+                         error: error,
+                         message: error.localizedDescription,
+                         codexError: error as? CodexUsageError)
+        }
+    }
+
+    // MARK: - Gemini Pro
+
+    private func refreshGemini(_ account: APIAccount) async {
+        do {
+            let usage = try await GeminiProService.shared.fetch()
+            let windows = [usage.primary, usage.secondary].compactMap { $0 }
+            let remaining = windows.map(\.remainingPercent).min()
+            clearErrors(account.id)
+            applySuccess(account,
+                         remaining: remaining,
+                         limitReached: usage.limitReached,
+                         gemini: usage)
+            DebugLog.write("Gemini 额度「\(account.name)」："
+                           + "剩余=\(remaining.map { String(format: "%.0f%%", $0) } ?? "无")，"
+                           + "窗口=\(windows.map(\.windowLabel).joined(separator: " / "))，"
+                           + "熔断=\(usage.limitReached)")
+        } catch {
+            // 「Antigravity 没开」是最常见的临时状态，用户随时可能把它打开。
+            // 这种情况不退避 —— 否则要干等满 15 分钟才会再去连一次。
+            let temporary: Bool
+            if case .notRunning = (error as? GeminiProError) { temporary = true } else { temporary = false }
+            applyFailure(account,
+                         error: error,
+                         message: error.localizedDescription,
+                         temporary: temporary,
+                         geminiError: error as? GeminiProError)
         }
     }
 
@@ -258,18 +436,18 @@ final class AppState: ObservableObject {
                     provider: Provider,
                     apiKey: String,
                     threshold: Double,
-                    codexAuthPath: String? = nil,
-                    codexCredentialKind: CodexCredentialKind = .authFile,
-                    codexAccountID: String? = nil) {
+                    authFilePath: String? = nil,
+                    credentialKind: LocalCredentialKind = .authFile,
+                    accountIDHint: String? = nil) {
         var account = APIAccount(
             name: name.isEmpty ? provider.displayName : name,
             provider: provider,
             alertThreshold: threshold
         )
-        account.codexAuthPath = codexAuthPath
-        account.codexCredentialKind = codexCredentialKind.rawValue
-        account.codexAccountID = codexAccountID
-        // 凭据只有粘贴 token 时才存进加密文件；auth.json 模式的凭据由 Codex 自己维护
+        account.authFilePath = authFilePath
+        account.credentialKind = credentialKind
+        account.accountIDHint = accountIDHint
+        // 凭据只有粘贴 token 时才存进加密文件；auth.json 模式的凭据由对方自己维护
         if !apiKey.isEmpty { account.keySuffix = String(apiKey.suffix(4)) }
 
         accounts.append(account)
@@ -298,30 +476,64 @@ final class AppState: ObservableObject {
         balances[account.id] = nil
         credentials.removeKey(for: account.id)
         accountsNeedingKey.remove(account.id)
-        codexBackoffUntil[account.id] = nil
-        snapshots.removeAll(for: account.id)
+        backoffUntil[account.id] = nil
         accountStore.save(accounts)
         if selectedAccountID == account.id {
             selectedAccountID = accounts.first?.id
         }
     }
 
-    /// 「添加 Codex 账号」用：把本机的 `~/.codex/auth.json` 加进来。
-    /// 已经加过就不重复添加，返回 nil。
+    /// 「导入本机 Grok」用：把 `~/.grok/auth.json` 加进来。已经加过就返回 nil。
+    @discardableResult
+    func addLocalGrokAccount() -> APIAccount? {
+        let target = GrokAuthStore.defaultAuthFileURL
+        let already = accounts.contains {
+            $0.provider == .grok && $0.credentialKind == .authFile
+                && $0.resolvedAuthURL.path == target.path
+        }
+        guard !already else { return nil }
+
+        var account = APIAccount(name: "Grok（本机）",
+                                 provider: .grok,
+                                 alertThreshold: Self.defaultThreshold)
+        account.credentialKind = .authFile
+        accounts.append(account)
+        accountStore.save(accounts)
+        if selectedAccountID == nil { selectedAccountID = account.id }
+        Task { await refresh(account, force: true) }
+        return account
+    }
+
+    /// 「导入本机 Codex」用：把 `~/.codex/auth.json` 加进来。已经加过就返回 nil。
     @discardableResult
     func addLocalCodexAccount() -> APIAccount? {
         let target = CodexAuthStore.defaultAuthFileURL
         let already = accounts.contains {
-            $0.isCodex && $0.credentialKind == .authFile && $0.resolvedAuthURL.path == target.path
+            $0.provider == .codex && $0.credentialKind == .authFile
+                && $0.resolvedAuthURL.path == target.path
         }
         guard !already else { return nil }
 
-        var account = APIAccount(
-            name: "Codex（本机）",
-            provider: .codex,
-            alertThreshold: AppState.defaultCodexThreshold
-        )
-        account.codexCredentialKind = CodexCredentialKind.authFile.rawValue
+        var account = APIAccount(name: "Codex（本机）",
+                                 provider: .codex,
+                                 alertThreshold: Self.defaultThreshold)
+        account.credentialKind = .authFile
+        accounts.append(account)
+        accountStore.save(accounts)
+        if selectedAccountID == nil { selectedAccountID = account.id }
+        Task { await refresh(account, force: true) }
+        return account
+    }
+
+    /// 「导入本机 Gemini Pro」用：把本机 Antigravity 探测加进来。
+    @discardableResult
+    func addLocalGeminiAccount() -> APIAccount? {
+        let already = accounts.contains { $0.provider == .gemini }
+        guard !already else { return nil }
+
+        let account = APIAccount(name: "Gemini Pro",
+                                 provider: .gemini,
+                                 alertThreshold: Self.defaultThreshold)
         accounts.append(account)
         accountStore.save(accounts)
         if selectedAccountID == nil { selectedAccountID = account.id }
@@ -341,7 +553,7 @@ final class AppState: ObservableObject {
         credentials.lookup(for: id)
     }
 
-    /// 删掉某个账号已保存的凭据（例如 Codex 账号从「粘贴 token」切成「读 auth.json」）
+    /// 删掉某个账号已保存的凭据（例如从「粘贴 token」切成「读 auth.json」）
     func clearCredential(for id: UUID) {
         credentials.removeKey(for: id)
         accountsNeedingKey.remove(id)
@@ -362,8 +574,6 @@ final class AppState: ObservableObject {
     ///
     /// 读取钥匙串会弹一次系统授权框 —— 这是最后一次，之后不再用钥匙串。
     /// 用户取消或读取失败都不影响账号可用性，只是那个账号会被标成「需重新填入」。
-    ///
-    /// 返回值表示是否真的搬到了东西，调用方据此决定要不要重刷。
     @discardableResult
     private func migrateLegacyCredentialsIfNeeded() async -> Bool {
         let defaults = UserDefaults.standard
@@ -413,7 +623,7 @@ final class AppState: ObservableObject {
         return !migratedIDs.isEmpty
     }
 
-    /// 清空本地保存的全部 API Key（账号、预警线、历史都不动）
+    /// 清空本地保存的全部 API Key（账号、预警线都不动）
     func clearAllCredentials() {
         credentials.removeAll()
         for index in accounts.indices where !accounts[index].keySuffix.isEmpty {
@@ -429,38 +639,19 @@ final class AppState: ObservableObject {
     /// 设置页展示用：密钥绑定方式
     var credentialBindingDescription: String { credentials.bindingDescription }
 
-    // MARK: - 派生数据
-
-    var selectedAccount: APIAccount? {
-        guard let id = selectedAccountID else { return accounts.first }
-        return accounts.first { $0.id == id } ?? accounts.first
-    }
-
-    var selectedBalance: AccountBalance? {
-        guard let account = selectedAccount else { return nil }
-        return balances[account.id]
-    }
-
     // MARK: - 按服务商分组
 
-    var deepseekAccounts: [APIAccount] { accounts.filter { $0.provider == .deepseek } }
+    var grokAccounts: [APIAccount] { accounts.filter { $0.provider == .grok } }
     var codexAccounts: [APIAccount] { accounts.filter { $0.provider == .codex } }
+    var geminiAccounts: [APIAccount] { accounts.filter { $0.provider == .gemini } }
 
-    /// 已启用的 DeepSeek 账号余额合计（同币种简单相加）
-    var deepseekTotalBalance: Double {
-        deepseekAccounts.filter(\.isEnabled).reduce(0) { partial, account in
-            partial + (balances[account.id]?.totalBalance ?? 0)
-        }
+    func enabledAccounts(of provider: Provider) -> [APIAccount] {
+        accounts.filter { $0.provider == provider && $0.isEnabled }
     }
 
-    /// 兼容旧调用点：合计只统计 DeepSeek。
-    /// Codex 是按百分比计量的，把 12.34 和 0% 相加没有任何意义。
-    var totalBalanceAllAccounts: Double { deepseekTotalBalance }
-
-    /// 已启用 Codex 账号里最低的剩余百分比 —— 最紧张的那个才是真正的约束
-    var codexLowestRemaining: Double? {
-        codexAccounts
-            .filter(\.isEnabled)
+    /// 某个服务商下所有已启用账号里最低的剩余百分比 —— 最紧张的那个才是真正的约束
+    func lowestRemaining(of provider: Provider) -> Double? {
+        enabledAccounts(of: provider)
             .compactMap { balances[$0.id]?.remainingPercent }
             .min()
     }
@@ -471,178 +662,11 @@ final class AppState: ObservableObject {
 
     var hasAccounts: Bool { !accounts.isEmpty }
 
-    /// 菜单栏展示的账号：优先选中的，否则第一个
-    var menuBarBalance: AccountBalance? {
-        guard let account = selectedAccount else { return nil }
-        return balances[account.id]
-    }
-
     /// 设置页里「新账号默认预警线」
     var defaultAlertThreshold: Double {
         let value = UserDefaults.standard.double(forKey: "defaultAlertThreshold")
-        return value > 0 ? value : 10
+        return value > 0 ? value : Self.defaultThreshold
     }
-
-    // MARK: - 菜单栏
-
-    /// 菜单栏状态取「最严重」的一方。
-    /// 余额充足但 Codex 已经用完了，也该是黄的 —— 只取其中一方会漏报。
-    func menuBarStatus(mode: MenuBarDisplayMode) -> MenuBarStatus {
-        guard hasAccounts else { return .error }
-
-        var candidates: [MenuBarStatus] = []
-        if let status = deepseekMenuBarStatus(mode: mode) { candidates.append(status) }
-        if let status = codexMenuBarStatus() { candidates.append(status) }
-
-        guard !candidates.isEmpty else { return .loading }
-        return candidates.max { severity($0) < severity($1) } ?? .loading
-    }
-
-    private func severity(_ status: MenuBarStatus) -> Int {
-        switch status {
-        case .normal:  return 0
-        case .loading: return 1
-        case .warning: return 2
-        case .error:   return 3
-        }
-    }
-
-    private func deepseekMenuBarStatus(mode: MenuBarDisplayMode) -> MenuBarStatus? {
-        let enabled = deepseekAccounts.filter(\.isEnabled)
-        guard !enabled.isEmpty else { return nil }
-
-        // `.current` 且选中的就是 DeepSeek 账号时看它自己，否则退回合计
-        if mode == .current,
-           let selected = selectedAccount, selected.provider == .deepseek {
-            guard let balance = balances[selected.id] else { return .loading }
-            if balance.errorMessage != nil { return .error }
-            return balance.comparableValue <= selected.alertThreshold ? .warning : .normal
-        }
-        return deepseekTotalStatus(enabled: enabled)
-    }
-
-    private func deepseekTotalStatus(enabled: [APIAccount]) -> MenuBarStatus {
-        let known = enabled.compactMap { balances[$0.id] }
-        guard !known.isEmpty else { return .loading }
-        // 只有全部账号都取不到数才算错误，个别失败不影响合计的参考价值
-        if known.allSatisfy({ $0.errorMessage != nil }) { return .error }
-        let thresholdSum = enabled.reduce(0) { $0 + $1.alertThreshold }
-        return deepseekTotalBalance <= thresholdSum ? .warning : .normal
-    }
-
-    private func codexMenuBarStatus() -> MenuBarStatus? {
-        let enabled = codexAccounts.filter(\.isEnabled)
-        guard !enabled.isEmpty else { return nil }
-
-        let known = enabled.compactMap { balances[$0.id] }
-        guard !known.isEmpty else { return .loading }
-
-        // 取数失败就是红灯。菜单栏上 Codex 只显示一个数字，数据坏了那个数字就没有意义 ——
-        // 这时候给黄灯会被误读成「额度低」。
-        if known.contains(where: { $0.errorMessage != nil }) { return .error }
-
-        for account in enabled {
-            guard let balance = balances[account.id] else { continue }
-            // 服务端熔断，或剩余低于预警线 → 黄灯
-            if balance.isLimitReached { return .warning }
-            if let percent = balance.remainingPercent, percent <= account.alertThreshold {
-                return .warning
-            }
-        }
-        return .normal
-    }
-
-    /// 菜单栏文本：各服务商并排，用 ` · ` 连接。
-    /// DeepSeek 给金额，Codex 给最低剩余百分比（带 `CX` 前缀避免和金额混淆）。
-    func menuBarText(mode: MenuBarDisplayMode) -> String {
-        guard hasAccounts else { return "" }
-
-        var parts: [String] = []
-        if let money = deepseekMenuBarText(mode: mode) { parts.append(money) }
-        if let codex = codexMenuBarText() { parts.append(codex) }
-
-        return parts.isEmpty ? "…" : parts.joined(separator: " · ")
-    }
-
-    private func deepseekMenuBarText(mode: MenuBarDisplayMode) -> String? {
-        let enabled = deepseekAccounts.filter(\.isEnabled)
-        guard !enabled.isEmpty else { return nil }
-
-        if mode == .current,
-           let selected = selectedAccount, selected.provider == .deepseek,
-           let balance = balances[selected.id] {
-            if balance.errorMessage != nil && !balance.hasValue { return "!" }
-            return balance.currencySymbol + balance.formattedTotal
-        }
-
-        let known = enabled.compactMap { balances[$0.id] }
-        guard !known.isEmpty else { return "…" }
-        if known.allSatisfy({ $0.errorMessage != nil && !$0.hasValue }) { return "!" }
-        return "¥" + formatMoney(deepseekTotalBalance)
-    }
-
-    private func codexMenuBarText() -> String? {
-        let enabled = codexAccounts.filter(\.isEnabled)
-        guard !enabled.isEmpty else { return nil }
-        guard let lowest = codexLowestRemaining else { return "CX …" }
-        return "CX \(Int(lowest.rounded()))%"
-    }
-
-    func menuBarSymbol(mode: MenuBarDisplayMode) -> String {
-        guard hasAccounts else { return "dollarsign.circle" }
-        switch menuBarStatus(mode: mode) {
-        case .normal: return "dollarsign.circle.fill"
-        case .warning: return "exclamationmark.triangle.fill"
-        case .error: return "exclamationmark.circle.fill"
-        case .loading: return "arrow.triangle.2.circlepath"
-        }
-    }
-
-    // MARK: - 趋势
-
-    func snapshots(for accountID: UUID) -> [BalanceSnapshot] {
-        snapshots.snapshots(for: accountID)
-    }
-
-    func dailyCosts(for accountID: UUID, days: Int) -> [DailyCost] {
-        TrendAnalyzer.dailyCosts(snapshots: snapshots.snapshots(for: accountID), days: days)
-    }
-
-    func todayCost(for accountID: UUID) -> Double {
-        TrendAnalyzer.todayCost(snapshots: snapshots.snapshots(for: accountID))
-    }
-
-    /// 本月消耗。从今天往前推「今天是几号」天，起点正好落在本月 1 日，即自然月至今。
-    func monthCost(for accountID: UUID) -> Double {
-        let calendar = Calendar.current
-        let dayOfMonth = calendar.component(.day, from: Date())
-        return TrendAnalyzer.totalCost(snapshots: snapshots.snapshots(for: accountID), days: dayOfMonth)
-    }
-
-    func estimatedDaysRemaining(for accountID: UUID) -> Double? {
-        // Codex 按百分比计量，没有「按消耗速度还能用几天」这回事
-        guard accounts.first(where: { $0.id == accountID })?.provider == .deepseek else { return nil }
-        guard let balance = balances[accountID] else { return nil }
-        return TrendAnalyzer.estimatedDaysRemaining(
-            balance: balance.totalBalance,
-            snapshots: snapshots.snapshots(for: accountID)
-        )
-    }
-
-    /// 清空某个账号的历史快照
-    func clearHistory(for accountID: UUID) {
-        snapshots.removeAll(for: accountID)
-        objectWillChange.send()
-    }
-
-    /// 清空所有账号的历史快照
-    func clearAllHistory() {
-        snapshots.removeAll()
-        objectWillChange.send()
-    }
-
-    /// 历史快照总条数，设置页展示用
-    var snapshotCount: Int { snapshots.totalCount }
 
     // MARK: - Codex
 
@@ -654,7 +678,118 @@ final class AppState: ObservableObject {
             return CodexAuthStore.load(from: account.resolvedAuthURL)
         case .pastedToken:
             guard case .found(let token) = credentials.lookup(for: account.id) else { return nil }
-            return CodexAuthStore.resolve(.token(token, accountID: account.codexAccountID))
+            return CodexAuthStore.resolve(.token(token, accountID: account.accountIDHint))
+        }
+    }
+
+    // MARK: - 菜单栏
+
+    /// 菜单栏要轮播的服务商（只含已启用的）。
+    ///
+    /// 顺序固定按 `Provider.allCases`，不跟着账号列表的增删走 ——
+    /// 否则每次导入一个账号，轮播的先后顺序就变一遍，看着像在乱跳。
+    var menuBarProviders: [Provider] {
+        Provider.allCases.filter { !enabledAccounts(of: $0).isEmpty }
+    }
+
+    /// 不轮播时固定显示的那一家。没设过、或设的那家已经不在列表里 → nil。
+    var menuBarPinnedProvider: Provider? {
+        Provider(rawValue: menuBarPinnedProviderRaw)
+    }
+
+    /// 设置「不轮播时固定显示哪一家」。传 nil 表示回到轮播顺序的第一家。
+    func setMenuBarPinnedProvider(_ provider: Provider?) {
+        let value = provider?.rawValue ?? ""
+        guard value != menuBarPinnedProviderRaw else { return }
+        menuBarPinnedProviderRaw = value
+        UserDefaults.standard.set(value, forKey: Self.pinnedProviderKey)
+        DebugLog.write("菜单栏：固定显示 \(provider?.displayName ?? "（未指定，用第一家）")")
+    }
+
+    /// 当前轮到的那一家。一家都没启用时返回 nil。
+    var currentMenuBarProvider: Provider? {
+        let providers = menuBarProviders
+        guard !providers.isEmpty else { return nil }
+
+        // 不轮播：听用户选的那一家。选的那家被停用/删掉了就退回第一家 ——
+        // 不能因为一个失效的选择让菜单栏整块变空。
+        if menuBarRotateSeconds <= 0 {
+            if let pinned = menuBarPinnedProvider, providers.contains(pinned) { return pinned }
+            return providers[0]
+        }
+
+        // 轮播：取模而不是直接索引 —— 账号被删掉之后 `menuBarRotation` 可能已经越界，
+        // 取模能让它在下一个 tick 之前也落在合法范围里。
+        return providers[menuBarRotation % providers.count]
+    }
+
+    /// 某一家的菜单栏状态。配色口径和环形图完全一致，见 `MenuBarStatus` 的注释。
+    ///
+    /// 数据取不到就是红灯：菜单栏上每家只显示一个数字，数据坏了那个数字就没有意义 ——
+    /// 这时候给橙色会被误读成「额度偏低」。
+    func menuBarStatus(for provider: Provider) -> MenuBarStatus {
+        let enabled = enabledAccounts(of: provider)
+        guard !enabled.isEmpty else { return .loading }
+
+        let known = enabled.compactMap { balances[$0.id] }
+        guard !known.isEmpty else { return .loading }
+
+        if known.contains(where: { $0.errorMessage != nil }) { return .error }
+        if known.contains(where: { $0.isLimitReached }) { return .critical }
+
+        guard let lowest = lowestRemaining(of: provider) else { return .loading }
+        // 和 QuotaStyle.tint 同一套分档：≥50 绿 / ≥20 橙 / <20 红
+        if lowest < 20 { return .critical }
+        if lowest < 50 { return .warning }
+        return .normal
+    }
+
+    /// 菜单栏当前显示的那一家的状态（无参版本给 `MenuBarLabel` 用）。
+    func menuBarStatus() -> MenuBarStatus {
+        guard hasAccounts else { return .error }
+        guard let provider = currentMenuBarProvider else { return .loading }
+        return menuBarStatus(for: provider)
+    }
+
+    /// 某一家的菜单栏文本，形如 `GR 37%`。
+    /// 同一家可能有多个账号，取最短的那个剩余百分比。
+    func menuBarText(for provider: Provider) -> String {
+        guard !enabledAccounts(of: provider).isEmpty else { return "" }
+        guard let lowest = lowestRemaining(of: provider) else {
+            return "\(provider.menuBarPrefix) …"
+        }
+        return "\(provider.menuBarPrefix) \(Int(lowest.rounded()))%"
+    }
+
+    /// 菜单栏当前显示的那一家的文本。
+    ///
+    /// 只显示一家（而不是三家并排）是刻意的：`GR 37% · CX 20% · GP 85%` 太长了，
+    /// 菜单栏那一格会把旁边的图标挤掉。轮流显示，颜色跟着**它自己**的额度状态走。
+    func menuBarText() -> String {
+        guard let provider = currentMenuBarProvider else {
+            return hasAccounts ? "…" : ""
+        }
+        return menuBarText(for: provider)
+    }
+
+    func menuBarSymbol(for provider: Provider) -> String {
+        Self.symbol(for: menuBarStatus(for: provider))
+    }
+
+    func menuBarSymbol() -> String {
+        guard hasAccounts else { return "gauge.medium" }
+        return Self.symbol(for: menuBarStatus())
+    }
+
+    /// 状态 → 图标。形状表达「哪一类问题」，颜色表达「多严重」：
+    /// 仪表盘 = 正常，三角 = 额度偏低，八角 = 快用完，圆圈 = 取不到数，箭头 = 还在查。
+    private static func symbol(for status: MenuBarStatus) -> String {
+        switch status {
+        case .normal:   return "gauge.medium"
+        case .warning:  return "exclamationmark.triangle.fill"
+        case .critical: return "exclamationmark.octagon.fill"
+        case .error:    return "exclamationmark.circle.fill"
+        case .loading:  return "arrow.triangle.2.circlepath"
         }
     }
 }

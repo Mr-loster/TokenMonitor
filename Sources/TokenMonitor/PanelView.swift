@@ -21,9 +21,10 @@ struct PanelView: View {
         _tab = LocalState(wrappedValue: initialTab)
     }
 
+    /// 原来的「趋势」页签已经去掉了 —— 它存在的唯一理由是给 DeepSeek 的金额画消耗曲线，
+    /// 而现在三个服务商都是按百分比计量的额度，接口不提供用量明细，画不出曲线。
     enum Tab: String, CaseIterable, Identifiable {
         case overview = "总览"
-        case trend = "趋势"
         case accounts = "账号"
         case settings = "设置"
         var id: String { rawValue }
@@ -51,34 +52,11 @@ struct PanelView: View {
 
     private var header: some View {
         HStack(spacing: 8) {
-            if state.accounts.count > 1 {
-                Menu {
-                    ForEach(state.accounts) { account in
-                        Button {
-                            state.selectedAccountID = account.id
-                        } label: {
-                            if account.id == state.selectedAccountID {
-                                Label(account.name, systemImage: "checkmark")
-                            } else {
-                                Text(account.name)
-                            }
-                        }
-                    }
-                } label: {
-                    HStack(spacing: 3) {
-                        Text(state.selectedAccount?.name ?? "未配置")
-                            .font(.system(size: 13, weight: .semibold))
-                        Image(systemName: "chevron.down")
-                            .font(.system(size: 9, weight: .semibold))
-                    }
-                }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .fixedSize()
-            } else {
-                Text(state.selectedAccount?.name ?? "未配置")
-                    .font(.system(size: 13, weight: .semibold))
-            }
+            // 这里原来是个「选择当前账号」的下拉菜单。总览页现在按服务商分组、
+            // 一屏把**所有**账号的额度都列出来，下拉已经没有任何东西可切了 ——
+            // 留着反而让人以为切换它会改变下面的内容。所以只留个标题。
+            Text("Token查询")
+                .font(.system(size: 13, weight: .semibold))
 
             Spacer()
 
@@ -114,16 +92,16 @@ struct PanelView: View {
     /// 内容区必须给确定高度：在菜单栏弹窗里，只设 maxHeight 的 ScrollView 会塌缩成 0，
     /// 把页签和内容一起吞掉。
     ///
-    /// 高度 480 是按总览页最挤的情况定的 —— DeepSeek 余额块 + Codex 额度块
-    /// （含重置时间、免费版说明、凭据到期、接口声明）实测约 480pt。
-    /// 屏幕逻辑高度 800，整块面板约 600pt，还在合理范围。
+    /// 高度 540 是按总览页最挤的情况定的 —— 三个服务商各一张卡片
+    /// （含环形图、重置时刻、明细）实测约 660pt，所以三家都启用时仍需轻微滚动，
+    /// 但两家以内可以完整看全。面板整体约 680pt，仍在 800pt 逻辑高度的屏幕内。
     private var contentScroll: some View {
         ScrollView(.vertical, showsIndicators: true) {
             currentContent
                 .padding(.horizontal, 14)
                 .padding(.vertical, 12)
         }
-        .frame(height: 480)
+        .frame(height: 540)
     }
 
     @ViewBuilder
@@ -137,8 +115,6 @@ struct PanelView: View {
             switch tab {
             case .overview:
                 OverviewView()
-            case .trend:
-                TrendView()
             case .accounts:
                 AccountsView(
                     onAdd: { openEditor(.newAccount) },
@@ -213,33 +189,6 @@ struct PanelView: View {
 }
 
 // MARK: - 共用小组件
-
-/// 指标卡
-struct MetricCard: View {
-    let label: String
-    let value: String
-    var tint: Color = .primary
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(label)
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-            Text(value)
-                .font(.system(size: 16, weight: .medium, design: .monospaced))
-                .foregroundStyle(tint)
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 9)
-        .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color(nsColor: .controlBackgroundColor))
-        )
-    }
-}
 
 /// 空状态提示
 struct EmptyHint: View {

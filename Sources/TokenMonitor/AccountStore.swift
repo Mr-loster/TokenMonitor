@@ -12,23 +12,31 @@ final class AccountStore {
     func load() -> [APIAccount] {
         guard let data = try? Data(contentsOf: fileURL) else { return [] }
 
-        do {
-            return try JSONDecoder().decode([APIAccount].self, from: data)
-        } catch {
-            // 这里**绝不能**静默返回空数组。
-            //
-            // 以前就是这个行为：只要有一个字段解不出来（比如新版本加了非可选字段，
-            // 而用户的 accounts.json 是旧版本写的），整个账号列表会变成空 ——
-            // 用户看到的是「我的账号全没了」，而且没有任何提示。
-            //
-            // 现在：留一条日志、把坏文件备份下来、仍然返回空数组让程序能启动，
-            // 但至少事后能查、能找回。
-            DebugLog.write("账号列表解码失败：\(error)。原文件已备份到 accounts.json.broken")
-            if let data = try? Data(contentsOf: fileURL) {
-                AppPaths.write(data, to: backupURL)
+        // 逐条解码：**任何一条坏掉都不该拖垮整个列表**。
+        //
+        // 以前是整数组一次性解码，只要有一个字段解不出来（例如新版本删掉了某个
+        // 服务商、而旧文件里还留着它的账号），整个账号列表会变成空 ——
+        // 用户看到的是「我的账号全没了」，而且没有任何提示。
+        //
+        // 现在用一个逐条兜底的包装：坏的那条丢掉并记日志，其余照常加载。
+        if let accounts = try? JSONDecoder().decode([LenientAccount].self, from: data) {
+            let good = accounts.compactMap(\.value)
+            let dropped = accounts.count - good.count
+            if dropped > 0 {
+                DebugLog.write("账号列表：跳过 \(dropped) 条无法解码的记录（可能来自已移除的服务商）")
+                backup(data)
             }
-            return []
+            return good
         }
+
+        // 连数组结构都不对（文件被截断、手改坏了）—— 备份后返回空
+        DebugLog.write("账号列表解码失败：整体结构不合法。原文件已备份到 accounts.json.broken")
+        backup(data)
+        return []
+    }
+
+    private func backup(_ data: Data) {
+        AppPaths.write(data, to: backupURL)
     }
 
     func save(_ accounts: [APIAccount]) {
@@ -37,5 +45,14 @@ final class AccountStore {
             return
         }
         AppPaths.write(data, to: fileURL)
+    }
+}
+
+/// 单条记录的容错解码器：解不出来就是 nil，不抛错。
+private struct LenientAccount: Decodable {
+    let value: APIAccount?
+
+    init(from decoder: Decoder) throws {
+        value = try? APIAccount(from: decoder)
     }
 }
