@@ -91,7 +91,7 @@ final class AppState: ObservableObject {
     /// 启动时留一条痕迹。「额度取不到」这类问题第一步就是看这里：
     /// 账号数对不对、有几个凭据需要重填、密钥是绑机器的还是存文件的。
     private func logStartup() {
-        DebugLog.write("启动 v2.0：账号 \(accounts.count) 个（Grok \(grokAccounts.count)"
+        DebugLog.write("启动 \(AppVersion.display)：账号 \(accounts.count) 个（Grok \(grokAccounts.count)"
                        + " / Codex \(codexAccounts.count) / Gemini \(geminiAccounts.count)），"
                        + "需重填凭据 \(accountsNeedingKey.count) 个，\(credentials.bindingDescription)")
     }

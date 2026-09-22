@@ -244,7 +244,7 @@ struct SettingsView: View {
                     Text("Token查询")
                         .font(.system(size: 12))
                     Spacer()
-                    Text("v2.0")
+                    Text(AppVersion.display)
                         .font(.system(size: 11))
                         .foregroundStyle(.tertiary)
                 }

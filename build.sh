@@ -3,7 +3,10 @@
 # 用法：bash build.sh
 set -e
 
-VERSION="2.0"
+VERSION="2.0.1"
+# 打包序号。Apple 要求 CFBundleVersion 单调递增，和 VERSION 分开维护：
+# VERSION 变了不一定动它，但每次发出去的新包都应该把它加一。
+BUILD="21"
 
 # 项目根目录 = 本脚本所在目录。这样 clone 到任意路径都能直接跑，
 # 也不会把开发机的绝对路径写进仓库。
@@ -50,6 +53,12 @@ cp "$PROJ/.build/release/TokenMonitor" "$APP/Contents/MacOS/"
 cp "$PROJ/Resources/Info.plist" "$APP/Contents/"
 cp "$PROJ/Resources/AppIcon.icns" "$APP/Contents/Resources/"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
+
+# 版本号以本脚本顶部的 VERSION / BUILD 为唯一事实来源。Resources/Info.plist 只当模板，
+# **不要**指望里面那份是对的 —— 以前这里原样拷贝，结果 App 自报 1.10、安装包却叫 2.0，
+# 「关于本机」显示的版本和下载下来的文件名对不上。
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD" "$APP/Contents/Info.plist"
 
 echo "==> ad-hoc 签名"
 xattr -cr "$APP" 2>/dev/null || true

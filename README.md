@@ -3,7 +3,26 @@
 macOS 菜单栏常驻的 AI 额度监控工具。剩余百分比挂在顶部菜单栏，点开是完整面板，
 每家服务商的每个额度窗口各画一个环形图，颜色随余量变化。
 
-当前版本 **v2.0**。监控 **Grok**、**Codex**、**Gemini Pro** 三家。
+当前版本 **v2.0.1**。监控 **Grok**、**Codex**、**Gemini Pro** 三家。
+
+---
+
+## v2.0.1 更新（Gemini Pro 不再依赖 Antigravity 在运行）
+
+这一版只修一个 bug：**关掉 Antigravity 桌面版、只开着 Antigravity CLI 或 Gemini
+桌面版时，Gemini Pro 额度读不出来。**
+
+原因是原实现走本机 Antigravity 的 `language_server` 接口，而它有两个前提：
+
+- **Gemini 桌面版根本不跑 `language_server`**，只跑它自己的原生进程，所以这条路对它无效。
+- **Antigravity CLI 把 `language_server` 内嵌在自己进程里**（进程名就是 `agy`），
+  而且它的 CSRF token 只存在于进程内存中 —— 环境变量、日志、钥匙串里都没有，
+  外部进程拿不到，本地端口等于用不了。
+
+改法是不再依赖本地端口，直接调 Google 的云端额度接口，凭据从 Antigravity 的登录信息里读
+（桌面版写的文件 / CLI 写的钥匙串，两处都读）。**Antigravity 关着也能读。**
+
+细节见下面「Gemini Pro 额度是怎么读到的」。
 
 ---
 
@@ -151,8 +170,8 @@ Grok 的 `auth.json` 顶层是「issuer::client_id → 凭据」的映射，键�
 
 | 文件 | 适合场景 | 安装方式 |
 |---|---|---|
-| **`Token查询-2.0.dmg`** | 分发、分享给别人（Mac 最主流） | 双击打开，把 App 拖进「应用程序」 |
-| **`Token查询-2.0.pkg`** | 标准安装向导 | 双击，一路「继续」，自动装到「应用程序」 |
+| **`Token查询-2.0.1.dmg`** | 分发、分享给别人（Mac 最主流） | 双击打开，把 App 拖进「应用程序」 |
+| **`Token查询-2.0.1.pkg`** | 标准安装向导 | 双击，一路「继续」，自动装到「应用程序」 |
 | **`Token查询.app`** | 本机快速使用 | 直接拖进「应用程序」 |
 
 > **首次打开**：App 没做 Apple 开发者签名，需要到「应用程序」里**右键**点 Token查询 →「打开」→
@@ -203,7 +222,7 @@ Cloudflare 的风控拦了这次请求。稍后重试；若持续出现，说明
 bash build.sh
 ```
 
-一次生成 `Token查询.app` + `Token查询-2.0.dmg` + `Token查询-2.0.pkg`。
+一次生成 `Token查询.app` + `Token查询-2.0.1.dmg` + `Token查询-2.0.1.pkg`。
 需要 macOS 自带 Command Line Tools（**不需要**完整 Xcode）。
 
 ---
@@ -280,7 +299,7 @@ bash build.sh
 bash build.sh
 ```
 
-一次产出 `dist/` 下的 `Token查询.app`、`Token查询-2.0.dmg`、`Token查询-2.0.pkg`。
+一次产出 `dist/` 下的 `Token查询.app`、`Token查询-2.0.1.dmg`、`Token查询-2.0.1.pkg`。
 App 是 ad-hoc 签名，首次打开需按上面「安装」里的说明放行一次。
 
 程序不需要注册任何账号，所有数据只存在本机。
